@@ -1,38 +1,64 @@
-from django.shortcuts import render  # (inutile mais gardé si tu l'utilises ailleurs)
+from decimal import Decimal
 
-# Create your views here.
-from rest_framework import viewsets, status
-from rest_framework.decorators import api_view, permission_classes
+from django.db import transaction
+from django.utils import timezone
+
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from django.db.models import Q, Sum
-from django.utils import timezone
-from django.db import transaction
+
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
 
 from .models import (
-    Client, Hall, Reservation, Payment, Service, ReservationService,
-    Material, ReservationMaterialUsage, ExpenseCategory, Expense,
-    CashMovement
+    Client,
+    Hall,
+    Service,
+    Material,
+    Reservation,
+    ReservationService,
+    ReservationMaterial,
+    FinancialAccount,
+    Payment,
+    CashMovement,
+    Expense,
+    Contract,
+    Notification,
 )
+
 from .serializers import (
-    ClientSerializer, HallSerializer, ReservationSerializer, PaymentSerializer,
-    ServiceSerializer, ReservationServiceSerializer, MaterialSerializer,
-    ReservationMaterialUsageSerializer, ExpenseCategorySerializer,
-    ExpenseSerializer, CashMovementSerializer
+    ClientSerializer,
+    HallSerializer,
+    ServiceSerializer,
+    MaterialSerializer,
+    ReservationSerializer,
+    ReservationServiceSerializer,
+    ReservationMaterialSerializer,
+    FinancialAccountSerializer,
+    PaymentSerializer,
+    CashMovementSerializer,
+    ExpenseSerializer,
+    ContractSerializer,
+    NotificationSerializer,
 )
 
-# ✅ PDF service
-from .services.pdf_service import (
-    generate_receipt_pdf,
-    generate_contract_pdf,
-)
+from .services.pdf_service import generate_payment_receipt_pdf
 
+
+# ============================================================
+# CLIENTS
+# ============================================================
 
 class ClientViewSet(viewsets.ModelViewSet):
-    queryset = Client.objects.all().order_by("-created_at")
+    queryset = Client.objects.all().order_by("full_name")
     serializer_class = ClientSerializer
     permission_classes = [IsAuthenticated]
 
+
+# ============================================================
+# SALLES
+# ============================================================
 
 class HallViewSet(viewsets.ModelViewSet):
     queryset = Hall.objects.all().order_by("name")
@@ -40,121 +66,9 @@ class HallViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-def overlaps(a_start, a_end, b_start, b_end):
-    # [a_start,a_end) intersects [b_start,b_end)
-    return a_start < b_end and b_start < a_end
-
-
-class ReservationViewSet(viewsets.ModelViewSet):
-    queryset = Reservation.objects.all().select_related("hall", "client").order_by("-date", "-created_at")
-    serializer_class = ReservationSerializer
-    permission_classes = [IsAuthenticated]
-
-    def _validate_no_overlap(self, hall_id, date, start_time, end_time, exclude_reservation_id=None):
-        qs = Reservation.objects.filter(hall_id=hall_id, date=date)
-        if exclude_reservation_id:
-            qs = qs.exclude(id=exclude_reservation_id)
-
-        for r in qs:
-            if overlaps(start_time, end_time, r.start_time, r.end_time) and r.status not in ["ANNULEE", "EVENT_TERMINE", "CLOTUREE"]:
-                return False, r.id
-        return True, None
-
-    @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        data = request.data
-        hall_id = data.get("hall")
-        date = data.get("date")
-        start_time = data.get("start_time")
-        end_time = data.get("end_time")
-
-        ok, conflict_id = self._validate_no_overlap(hall_id, date, start_time, end_time)
-        if not ok:
-            return Response(
-                {"detail": f"Conflit de réservation avec reservation_id={conflict_id}"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        obj = serializer.save(created_by=request.user)
-
-        # ✅ Optionnel : si créée directement en CONFIRMEE
-        if obj.status == "CONFIRMEE" and not getattr(obj, "contract_pdf", None):
-            pdf_file = generate_contract_pdf(obj, request)
-            obj.contract_pdf.save(f"contrat_{obj.id}.pdf", pdf_file, save=True)
-
-        return Response(self.get_serializer(obj).data, status=status.HTTP_201_CREATED)
-
-    @transaction.atomic
-    def update(self, request, *args, **kwargs):
-        reservation = self.get_object()
-        data = request.data
-
-        # ✅ IMPORTANT : capturer l'ancien status AVANT serializer.save()
-        old_status = reservation.status
-
-        hall_id = data.get("hall", reservation.hall_id)
-        date = data.get("date", reservation.date)
-        start_time = data.get("start_time", reservation.start_time)
-        end_time = data.get("end_time", reservation.end_time)
-
-        ok, conflict_id = self._validate_no_overlap(
-            hall_id, date, start_time, end_time,
-            exclude_reservation_id=reservation.id
-        )
-        if not ok:
-            return Response(
-                {"detail": f"Conflit de réservation avec reservation_id={conflict_id}"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        serializer = self.get_serializer(reservation, data=data, partial=False)
-        serializer.is_valid(raise_exception=True)
-        obj = serializer.save()
-
-        # ✅ Générer contrat seulement si passage vers CONFIRMEE
-        if old_status != "CONFIRMEE" and obj.status == "CONFIRMEE":
-            if not getattr(obj, "contract_pdf", None):
-                pdf_file = generate_contract_pdf(obj, request)
-                obj.contract_pdf.save(f"contrat_{obj.id}.pdf", pdf_file, save=True)
-
-        return Response(self.get_serializer(obj).data)
-
-
-class PaymentViewSet(viewsets.ModelViewSet):
-    queryset = Payment.objects.all().select_related("reservation", "recorded_by")
-    serializer_class = PaymentSerializer
-    permission_classes = [IsAuthenticated]
-
-    @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        # Save payment
-        obj = serializer.save(recorded_by=request.user)
-
-        # Cash IN
-        CashMovement.objects.create(
-            movement_type=CashMovement.MovementType.IN,
-            amount=obj.amount,
-            date=obj.date,
-            note=f"Paiement {obj.receipt_number}",
-            payment=obj
-        )
-
-        # ✅ Générer reçu PDF après chaque paiement
-        if not getattr(obj, "receipt_pdf", None):
-            pdf_file = generate_receipt_pdf(obj, request)
-            obj.receipt_pdf.save(
-                f"recu_{obj.receipt_number}_{obj.id}.pdf",
-                pdf_file,
-                save=True
-            )
-
-        return Response(self.get_serializer(obj).data, status=status.HTTP_201_CREATED)
-
+# ============================================================
+# SERVICES
+# ============================================================
 
 class ServiceViewSet(viewsets.ModelViewSet):
     queryset = Service.objects.all().order_by("name")
@@ -162,11 +76,9 @@ class ServiceViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-class ReservationServiceViewSet(viewsets.ModelViewSet):
-    queryset = ReservationService.objects.all().select_related("reservation", "service")
-    serializer_class = ReservationServiceSerializer
-    permission_classes = [IsAuthenticated]
-
+# ============================================================
+# MATERIEL
+# ============================================================
 
 class MaterialViewSet(viewsets.ModelViewSet):
     queryset = Material.objects.all().order_by("name")
@@ -174,141 +86,548 @@ class MaterialViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-class ReservationMaterialUsageViewSet(viewsets.ModelViewSet):
-    queryset = ReservationMaterialUsage.objects.all().select_related("reservation", "material")
-    serializer_class = ReservationMaterialUsageSerializer
+# ============================================================
+# RESERVATIONS
+# ============================================================
+
+class ReservationViewSet(viewsets.ModelViewSet):
+    queryset = (
+        Reservation.objects
+        .select_related("client", "hall")
+        .prefetch_related("payments")
+        .order_by("-event_date")
+    )
+
+    serializer_class = ReservationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        reservation = serializer.save(
+            created_by=self.request.user
+        )
+
+        Notification.objects.create(
+            user=self.request.user,
+            notification_type=Notification.NotificationType.RESERVATION_CREATED,
+            title="Nouvelle réservation",
+            message=(
+                f"La réservation {reservation.reservation_number} "
+                f"a été créée."
+            ),
+            reservation=reservation,
+        )
+
+    def perform_update(self, serializer):
+        reservation = serializer.save()
+
+        if reservation.status == Reservation.Status.CONFIRMEE:
+            Notification.objects.create(
+                user=self.request.user,
+                notification_type=(
+                    Notification.NotificationType.RESERVATION_CONFIRMED
+                ),
+                title="Réservation confirmée",
+                message=(
+                    f"La réservation {reservation.reservation_number} "
+                    f"a été confirmée."
+                ),
+                reservation=reservation,
+            )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="confirmer"
+    )
+    def confirmer(self, request, pk=None):
+        reservation = self.get_object()
+
+        if reservation.status == Reservation.Status.ANNULEE:
+            return Response(
+                {
+                    "detail": (
+                        "Une réservation annulée ne peut pas être confirmée."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reservation.status = Reservation.Status.CONFIRMEE
+        reservation.save()
+
+        Notification.objects.create(
+            user=request.user,
+            notification_type=(
+                Notification.NotificationType.RESERVATION_CONFIRMED
+            ),
+            title="Réservation confirmée",
+            message=(
+                f"La réservation {reservation.reservation_number} "
+                f"est maintenant confirmée."
+            ),
+            reservation=reservation,
+        )
+
+        return Response(
+            ReservationSerializer(
+                reservation,
+                context={"request": request}
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="annuler"
+    )
+    def annuler(self, request, pk=None):
+        reservation = self.get_object()
+
+        reservation.status = Reservation.Status.ANNULEE
+        reservation.save()
+
+        Notification.objects.create(
+            user=request.user,
+            notification_type=(
+                Notification.NotificationType.RESERVATION_CANCELLED
+            ),
+            title="Réservation annulée",
+            message=(
+                f"La réservation {reservation.reservation_number} "
+                f"a été annulée."
+            ),
+            reservation=reservation,
+        )
+
+        return Response(
+            ReservationSerializer(reservation).data
+        )
+
+
+# ============================================================
+# RESERVATION SERVICES
+# ============================================================
+
+class ReservationServiceViewSet(viewsets.ModelViewSet):
+    queryset = ReservationService.objects.select_related(
+        "reservation",
+        "service"
+    ).all()
+
+    serializer_class = ReservationServiceSerializer
     permission_classes = [IsAuthenticated]
 
 
-class ExpenseCategoryViewSet(viewsets.ModelViewSet):
-    queryset = ExpenseCategory.objects.all().order_by("name")
-    serializer_class = ExpenseCategorySerializer
+# ============================================================
+# RESERVATION MATERIEL
+# ============================================================
+
+class ReservationMaterialViewSet(viewsets.ModelViewSet):
+    queryset = ReservationMaterial.objects.select_related(
+        "reservation",
+        "material"
+    ).all()
+
+    serializer_class = ReservationMaterialSerializer
     permission_classes = [IsAuthenticated]
 
+
+# ============================================================
+# COMPTES FINANCIERS
+# ============================================================
+
+class FinancialAccountViewSet(viewsets.ModelViewSet):
+    queryset = FinancialAccount.objects.all()
+    serializer_class = FinancialAccountSerializer
+    permission_classes = [IsAuthenticated]
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="solde"
+    )
+    def solde(self, request, pk=None):
+        account = self.get_object()
+
+        return Response(
+            {
+                "id": account.id,
+                "name": account.name,
+                "account_type": account.account_type,
+                "balance": account.balance,
+            }
+        )
+
+
+# ============================================================
+# PAIEMENTS
+# ============================================================
+
+class PaymentViewSet(viewsets.ModelViewSet):
+    queryset = Payment.objects.select_related(
+        "reservation",
+        "reservation__client",
+        "financial_account",
+        "created_by",
+    ).all()
+
+    serializer_class = PaymentSerializer
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+
+        payment = serializer.save(
+            created_by=self.request.user
+        )
+
+        reservation = payment.reservation
+        account = payment.financial_account
+
+        # ----------------------------------------------------
+        # 1. RECALCUL DE LA RESERVATION
+        # ----------------------------------------------------
+
+        reservation.recalculate_financials()
+        reservation.save(
+            update_fields=[
+                "paid_amount",
+                "remaining_amount",
+                "payment_status",
+                "updated_at",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # 2. MOUVEMENT FINANCIER
+        # ----------------------------------------------------
+
+        CashMovement.objects.create(
+            account=account,
+            movement_type=CashMovement.MovementType.ENTREE,
+            amount=payment.amount,
+            description=(
+                f"Paiement {reservation.reservation_number} "
+                f"- {payment.amount}"
+            ),
+            payment=payment,
+            reservation=reservation,
+            created_by=self.request.user,
+        )
+
+        # ----------------------------------------------------
+        # 3. MISE A JOUR DU COMPTE
+        # ----------------------------------------------------
+
+        account.balance += payment.amount
+        account.save(update_fields=["balance"])
+
+        # ----------------------------------------------------
+        # 4. NOTIFICATION
+        # ----------------------------------------------------
+
+        if reservation.payment_status == Reservation.PaymentStatus.PAYE:
+            notification_type = (
+                Notification.NotificationType.PAYMENT_COMPLETED
+            )
+
+            title = "Paiement complet"
+
+            message = (
+                f"Le paiement de la réservation "
+                f"{reservation.reservation_number} "
+                f"est maintenant complet."
+            )
+
+        else:
+            notification_type = (
+                Notification.NotificationType.PAYMENT_PARTIAL
+            )
+
+            title = "Paiement reçu"
+
+            message = (
+                f"Un paiement de {payment.amount} a été reçu "
+                f"pour la réservation "
+                f"{reservation.reservation_number}. "
+                f"Reste à payer : {reservation.remaining_amount}."
+            )
+
+        Notification.objects.create(
+            user=self.request.user,
+            notification_type=notification_type,
+            title=title,
+            message=message,
+            reservation=reservation,
+            payment=payment,
+        )
+
+        # ----------------------------------------------------
+        # 5. GENERATION DU PDF DU PAIEMENT
+        # ----------------------------------------------------
+
+        try:
+            pdf_file = generate_payment_receipt_pdf(payment)
+
+            if pdf_file:
+                payment.receipt_pdf.save(
+                    f"recu-{payment.id}.pdf",
+                    pdf_file,
+                    save=True,
+                )
+
+        except Exception as error:
+            # Le paiement reste enregistré même si
+            # la génération du PDF échoue.
+            print(
+                f"Erreur génération reçu PDF : {error}"
+            )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="recu"
+    )
+    def recu(self, request, pk=None):
+        payment = self.get_object()
+
+        if not payment.receipt_pdf:
+            return Response(
+                {
+                    "detail": "Aucun reçu PDF n'est disponible."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            {
+                "payment_id": payment.id,
+                "receipt_pdf": request.build_absolute_uri(
+                    payment.receipt_pdf.url
+                ),
+            }
+        )
+
+
+# ============================================================
+# DEPENSES
+# ============================================================
 
 class ExpenseViewSet(viewsets.ModelViewSet):
-    queryset = Expense.objects.all().select_related("category", "recorded_by").order_by("-date", "-created_at")
+    queryset = Expense.objects.select_related(
+        "financial_account",
+        "created_by",
+    ).all()
+
     serializer_class = ExpenseSerializer
     permission_classes = [IsAuthenticated]
 
     @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        amount = serializer.validated_data["amount"]
-        date = serializer.validated_data.get("date") or timezone.now().date()
-        obj = serializer.save(recorded_by=request.user)
+    def perform_create(self, serializer):
+
+        expense = serializer.save(
+            created_by=self.request.user
+        )
+
+        account = expense.financial_account
+
+        if account.balance < expense.amount:
+            raise ValueError(
+                "Solde insuffisant pour effectuer cette dépense."
+            )
+
+        account.balance -= expense.amount
+        account.save(update_fields=["balance"])
 
         CashMovement.objects.create(
-            movement_type=CashMovement.MovementType.OUT,
-            amount=amount,
-            date=date,
-            note=f"Dépense {obj.category.name if obj.category else ''}".strip(),
-            expense=obj
+            account=account,
+            movement_type=CashMovement.MovementType.SORTIE,
+            amount=expense.amount,
+            description=expense.description,
+            created_by=self.request.user,
         )
-        return Response(self.get_serializer(obj).data, status=status.HTTP_201_CREATED)
 
+        Notification.objects.create(
+            user=self.request.user,
+            notification_type=(
+                Notification.NotificationType.EXPENSE_CREATED
+            ),
+            title="Dépense enregistrée",
+            message=(
+                f"Une dépense de {expense.amount} "
+                f"a été enregistrée."
+            ),
+        )
+
+
+# ============================================================
+# MOUVEMENTS FINANCIERS
+# ============================================================
 
 class CashMovementViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = CashMovement.objects.all().select_related("payment", "expense").order_by("-date", "-created_at")
+    queryset = CashMovement.objects.select_related(
+        "account",
+        "payment",
+        "reservation",
+        "created_by",
+    ).all()
+
     serializer_class = CashMovementSerializer
     permission_classes = [IsAuthenticated]
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def dashboard(request):
-    today = timezone.now().date()
+# ============================================================
+# CONTRATS
+# ============================================================
 
-    weekday = today.weekday()
-    start_week = today - timezone.timedelta(days=weekday)
-    end_week = start_week + timezone.timedelta(days=6)
+class ContractViewSet(viewsets.ModelViewSet):
+    queryset = Contract.objects.select_related(
+        "reservation",
+        "reservation__client",
+    ).all()
 
-    start_month = today.replace(day=1)
-    if today.month == 12:
-        start_next = today.replace(year=today.year + 1, month=1, day=1)
-    else:
-        start_next = today.replace(month=today.month + 1, day=1)
+    serializer_class = ContractSerializer
+    permission_classes = [IsAuthenticated]
 
-    res_week = Reservation.objects.filter(date__range=[start_week, end_week]).exclude(status__in=["ANNULEE"])
-    paid_month = Payment.objects.filter(date__gte=start_month, date__lt=start_next)
-    paid_total_month = paid_month.aggregate(Sum("amount")).get("amount__sum") or 0
-
-    res_count = Reservation.objects.filter(
-        date__gte=start_week,
-        date__lte=end_week,
-        status__in=["DEMANDE", "EN_ATTENTE", "CONFIRMEE"]
-    ).count()
-
-    clients_active = Client.objects.count()
-
-    cash_in = CashMovement.objects.filter(movement_type=CashMovement.MovementType.IN).aggregate(Sum("amount")).get("amount__sum") or 0
-    cash_out = CashMovement.objects.filter(movement_type=CashMovement.MovementType.OUT).aggregate(Sum("amount")).get("amount__sum") or 0
-    cash_balance = cash_in - cash_out
-
-    exp_month = Expense.objects.filter(date__gte=start_month, date__lt=start_next)
-    exp_total_month = exp_month.aggregate(Sum("amount")).get("amount__sum") or 0
-
-    open_res = Reservation.objects.filter(status__in=["DEMANDE", "EN_ATTENTE", "CONFIRMEE"])
-    solde = 0
-    for r in open_res:
-        solde += r.remaining
-
-    alerts = []
-    overdue = Reservation.objects.filter(status__in=["DEMANDE", "EN_ATTENTE", "CONFIRMEE"], date__lt=today)
-    if overdue.exists():
-        alerts.append("🔴 Paiements en retard")
-    pending = Reservation.objects.filter(status="EN_ATTENTE")
-    if pending.exists():
-        alerts.append("🟠 Réservations à confirmer")
-
-    tomorrow = today + timezone.timedelta(days=1)
-    if Reservation.objects.filter(date=tomorrow, status__in=["DEMANDE", "EN_ATTENTE", "CONFIRMEE"]).exists():
-        alerts.append("🟡 Événements prévus demain")
-
-    if open_res.exists():
-        alerts.append("🔵 Contrats à signer")
-    if Payment.objects.filter(date=today).exists():
-        alerts.append("🟢 Paiements reçus")
-
-    return Response({
-        "reservations_week": res_count,
-        "revenue_month": float(paid_total_month),
-        "remaining_total": float(solde),
-        "events_week_count": res_week.count(),
-        "active_clients": clients_active,
-        "expenses_month": float(exp_total_month),
-        "cash_balance": float(cash_balance),
-        "alerts": alerts
-    })
+    def perform_create(self, serializer):
+        serializer.save(
+            uploaded_by=self.request.user
+        )
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def reservations_calendar(request, year, month):
-    from calendar import monthrange
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
 
-    y = int(year)
-    m = int(month)
-    start_day, last_day = 1, monthrange(y, m)[1]
-    out = []
+class NotificationViewSet(viewsets.ModelViewSet):
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
 
-    for d in range(start_day, last_day + 1):
-        qd = timezone.datetime(y, m, d).date()
-        items = Reservation.objects.filter(date=qd).select_related("hall", "client").exclude(status="ANNULEE")
+    def get_queryset(self):
+        return Notification.objects.filter(
+            user=self.request.user
+        ).select_related(
+            "reservation",
+            "payment",
+        )
 
-        payload = []
-        for r in items:
-            payload.append({
-                "id": r.id,
-                "event_type": r.event_type,
-                "title": r.event_title or r.client.full_name,
-                "hall": r.hall.name,
-                "start_time": str(r.start_time),
-                "end_time": str(r.end_time),
-                "status": r.status
-            })
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="lire"
+    )
+    def lire(self, request, pk=None):
+        notification = self.get_object()
 
-        out.append({"date": str(qd), "items": payload})
+        notification.is_read = True
+        notification.read_at = timezone.now()
+        notification.save(
+            update_fields=[
+                "is_read",
+                "read_at",
+            ]
+        )
 
-    return Response({"year": year, "month": month, "days": out})
+        return Response(
+            NotificationSerializer(notification).data
+        )
+
+
+
+# ============================================================
+# CALENDRIER
+# ============================================================
+
+def calendar_view(request, year, month):
+    """
+    Retourne les réservations d'un mois donné.
+
+    Exemple :
+    GET /api/calendar/2026/9/
+    """
+
+    if request.method != "GET":
+        return JsonResponse(
+            {
+                "detail": "Méthode non autorisée."
+            },
+            status=405,
+        )
+
+    # Vérification du mois
+    if month < 1 or month > 12:
+        return JsonResponse(
+            {
+                "detail": "Le mois doit être compris entre 1 et 12."
+            },
+            status=400,
+        )
+
+    reservations = (
+        Reservation.objects
+        .filter(
+            event_date__year=year,
+            event_date__month=month,
+        )
+        .select_related(
+            "client",
+            "hall",
+        )
+        .order_by(
+            "event_date",
+            "start_time",
+        )
+    )
+
+    data = []
+
+    for reservation in reservations:
+        data.append(
+            {
+                "id": reservation.id,
+                "reservation_number": reservation.reservation_number,
+                "client": (
+                    reservation.client.full_name
+                    if reservation.client
+                    else None
+                ),
+                "hall": (
+                    reservation.hall.name
+                    if reservation.hall
+                    else None
+                ),
+                "event_type": reservation.event_type,
+                "date": (
+                    reservation.event_date.isoformat()
+                    if reservation.event_date
+                    else None
+                ),
+                "start_time": (
+                    reservation.start_time.strftime("%H:%M")
+                    if reservation.start_time
+                    else None
+                ),
+                "end_time": (
+                    reservation.end_time.strftime("%H:%M")
+                    if reservation.end_time
+                    else None
+                ),
+                "guests_count": reservation.guests_count,
+                "total_amount": str(reservation.total_amount),
+                "paid_amount": str(reservation.paid_amount),
+                "remaining_amount": str(
+                    reservation.remaining_amount
+                ),
+                "payment_status": reservation.payment_status,
+                "status": reservation.status,
+            }
+        )
+
+    return JsonResponse(
+        {
+            "year": year,
+            "month": month,
+            "count": len(data),
+            "results": data,
+        }
+    )

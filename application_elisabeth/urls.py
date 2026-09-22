@@ -1,28 +1,104 @@
-from rest_framework.routers import DefaultRouter
 from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
 from .views import (
-    ClientViewSet, HallViewSet, ReservationViewSet, PaymentViewSet,
-    ServiceViewSet, ReservationServiceViewSet, MaterialViewSet,
-    ReservationMaterialUsageViewSet, ExpenseCategoryViewSet, ExpenseViewSet,
+    ClientViewSet,
+    HallViewSet,
+    ServiceViewSet,
+    MaterialViewSet,
+    ReservationViewSet,
+    ReservationServiceViewSet,
+    ReservationMaterialViewSet,
+    FinancialAccountViewSet,
+    PaymentViewSet,
     CashMovementViewSet,
-    dashboard, reservations_calendar
+    ExpenseViewSet,
+    ContractViewSet,
+    NotificationViewSet,
 )
 
+
 router = DefaultRouter()
-router.register(r"clients", ClientViewSet)
-router.register(r"halls", HallViewSet)
-router.register(r"reservations", ReservationViewSet)
-router.register(r"payments", PaymentViewSet)
-router.register(r"services", ServiceViewSet)
-router.register(r"reservation-services", ReservationServiceViewSet)
-router.register(r"materials", MaterialViewSet)
-router.register(r"reservation-materials", ReservationMaterialUsageViewSet)
-router.register(r"expense-categories", ExpenseCategoryViewSet)
-router.register(r"expenses", ExpenseViewSet)
-router.register(r"cash-movements", CashMovementViewSet, basename="cash-movements")
+
+router.register(
+    "clients",
+    ClientViewSet,
+    basename="client"
+)
+
+router.register(
+    "halls",
+    HallViewSet,
+    basename="hall"
+)
+
+router.register(
+    "services",
+    ServiceViewSet,
+    basename="service"
+)
+
+router.register(
+    "materials",
+    MaterialViewSet,
+    basename="material"
+)
+
+router.register(
+    "reservations",
+    ReservationViewSet,
+    basename="reservation"
+)
+
+router.register(
+    "reservation-services",
+    ReservationServiceViewSet,
+    basename="reservation-service"
+)
+
+router.register(
+    "reservation-materials",
+    ReservationMaterialViewSet,
+    basename="reservation-material"
+)
+
+router.register(
+    "accounts",
+    FinancialAccountViewSet,
+    basename="financial-account"
+)
+
+router.register(
+    "payments",
+    PaymentViewSet,
+    basename="payment"
+)
+
+router.register(
+    "cash-movements",
+    CashMovementViewSet,
+    basename="cash-movement"
+)
+
+router.register(
+    "expenses",
+    ExpenseViewSet,
+    basename="expense"
+)
+
+router.register(
+    "contracts",
+    ContractViewSet,
+    basename="contract"
+)
+
+router.register(
+    "notifications",
+    NotificationViewSet,
+    basename="notification"
+)
+
 
 urlpatterns = [
     path("", include(router.urls)),
-    path("dashboard/", dashboard, name="dashboard"),
-    path("calendar/<int:year>/<int:month>/", reservations_calendar, name="calendar"),
 ]
