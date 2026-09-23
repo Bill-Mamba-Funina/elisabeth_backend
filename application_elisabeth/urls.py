@@ -1,4 +1,5 @@
 from django.urls import path, include
+
 from rest_framework.routers import DefaultRouter
 
 from .views import (
@@ -15,6 +16,7 @@ from .views import (
     ExpenseViewSet,
     ContractViewSet,
     NotificationViewSet,
+    calendar_view,
 )
 
 
@@ -101,4 +103,10 @@ router.register(
 
 urlpatterns = [
     path("", include(router.urls)),
+
+    path(
+        "calendar/<int:year>/<int:month>/",
+        calendar_view,
+        name="calendar",
+    ),
 ]

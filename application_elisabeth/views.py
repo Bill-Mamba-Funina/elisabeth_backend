@@ -3,6 +3,12 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from rest_framework.decorators import (
+    action,
+    api_view,
+    permission_classes,
+)
+
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -538,6 +544,12 @@ class NotificationViewSet(viewsets.ModelViewSet):
 # CALENDRIER
 # ============================================================
 
+# ============================================================
+# CALENDRIER
+# ============================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def calendar_view(request, year, month):
     """
     Retourne les réservations d'un mois donné.
@@ -545,14 +557,6 @@ def calendar_view(request, year, month):
     Exemple :
     GET /api/calendar/2026/9/
     """
-
-    if request.method != "GET":
-        return JsonResponse(
-            {
-                "detail": "Méthode non autorisée."
-            },
-            status=405,
-        )
 
     # Vérification du mois
     if month < 1 or month > 12:
@@ -586,39 +590,55 @@ def calendar_view(request, year, month):
             {
                 "id": reservation.id,
                 "reservation_number": reservation.reservation_number,
+
                 "client": (
                     reservation.client.full_name
                     if reservation.client
                     else None
                 ),
+
                 "hall": (
                     reservation.hall.name
                     if reservation.hall
                     else None
                 ),
+
                 "event_type": reservation.event_type,
+
                 "date": (
                     reservation.event_date.isoformat()
                     if reservation.event_date
                     else None
                 ),
+
                 "start_time": (
                     reservation.start_time.strftime("%H:%M")
                     if reservation.start_time
                     else None
                 ),
+
                 "end_time": (
                     reservation.end_time.strftime("%H:%M")
                     if reservation.end_time
                     else None
                 ),
-                "guests_count": reservation.guests_count,
-                "total_amount": str(reservation.total_amount),
-                "paid_amount": str(reservation.paid_amount),
+
+                "guest_count": reservation.guest_count,
+
+                "total_amount": str(
+                    reservation.total_amount
+                ),
+
+                "paid_amount": str(
+                    reservation.paid_amount
+                ),
+
                 "remaining_amount": str(
                     reservation.remaining_amount
                 ),
+
                 "payment_status": reservation.payment_status,
+
                 "status": reservation.status,
             }
         )
