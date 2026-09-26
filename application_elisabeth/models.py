@@ -1,8 +1,7 @@
-from decimal import Decimal
-
+﻿from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
@@ -10,742 +9,294 @@ from django.utils import timezone
 # ============================================================
 # CLIENT
 # ============================================================
-
 class Client(models.Model):
     full_name = models.CharField(max_length=200)
-    phone = models.CharField(max_length=50)
-    email = models.EmailField(blank=True, null=True)
-    address = models.TextField(blank=True, null=True)
-
-    notes = models.TextField(blank=True, null=True)
-
+    phone = models.CharField(
+        max_length=50,
+        unique=True,
+        db_index=True,
+    )
+    email = models.EmailField(
+        blank=True,
+        null=True,
+    )
+    address = models.TextField(
+        blank=True,
+        null=True,
+    )
+    notes = models.TextField(
+        blank=True,
+        null=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["full_name"]
+        verbose_name = "Client"
+        verbose_name_plural = "Clients"
 
     def __str__(self):
-        return self.full_name
+        return f"{self.full_name} - {self.phone}"
 
 
 # ============================================================
 # SALLE
 # ============================================================
-
-from decimal import Decimal
-
-from django.db import transaction
-from django.utils import timezone
-
-from rest_framework.decorators import (
-    action,
-    api_view,
-    permission_classes,
-)
-
-from rest_framework import status, viewsets
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-
-from django.http import JsonResponse
-from django.shortcuts import get_object_or_404
-
-from .models import (
-    Client,
-    Hall,
-    Service,
-    Material,
-    Reservation,
-    ReservationService,
-    ReservationMaterial,
-    FinancialAccount,
-    Payment,
-    CashMovement,
-    Expense,
-    Contract,
-    Notification,
-)
-
-from .serializers import (
-    ClientSerializer,
-    HallSerializer,
-    ServiceSerializer,
-    MaterialSerializer,
-    ReservationSerializer,
-    ReservationServiceSerializer,
-    ReservationMaterialSerializer,
-    FinancialAccountSerializer,
-    PaymentSerializer,
-    CashMovementSerializer,
-    ExpenseSerializer,
-    ContractSerializer,
-    NotificationSerializer,
-)
-
-from .services.pdf_service import generate_payment_receipt_pdf
-
-
-# ============================================================
-# CLIENTS
-# ============================================================
-
-class ClientViewSet(viewsets.ModelViewSet):
-    queryset = Client.objects.all().order_by("full_name")
-    serializer_class = ClientSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# SALLES
-# ============================================================
-
-class HallViewSet(viewsets.ModelViewSet):
-    queryset = Hall.objects.all().order_by("name")
-    serializer_class = HallSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# SERVICES
-# ============================================================
-
-class ServiceViewSet(viewsets.ModelViewSet):
-    queryset = Service.objects.all().order_by("name")
-    serializer_class = ServiceSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# MATERIEL
-# ============================================================
-
-class MaterialViewSet(viewsets.ModelViewSet):
-    queryset = Material.objects.all().order_by("name")
-    serializer_class = MaterialSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# RESERVATIONS
-# ============================================================
-
-class ReservationViewSet(viewsets.ModelViewSet):
-    queryset = (
-        Reservation.objects
-        .select_related("client", "hall")
-        .prefetch_related("payments")
-        .order_by("-event_date")
+class Hall(models.Model):
+    name = models.CharField(
+        max_length=150,
+        unique=True,
     )
-
-    serializer_class = ReservationSerializer
-    permission_classes = [IsAuthenticated]
-
-    def perform_create(self, serializer):
-        reservation = serializer.save(
-            created_by=self.request.user
-        )
-
-        Notification.objects.create(
-            user=self.request.user,
-            notification_type=Notification.NotificationType.RESERVATION_CREATED,
-            title="Nouvelle réservation",
-            message=(
-                f"La réservation {reservation.reservation_number} "
-                f"a été créée."
-            ),
-            reservation=reservation,
-        )
-
-    def perform_update(self, serializer):
-        reservation = serializer.save()
-
-        if reservation.status == Reservation.Status.CONFIRMEE:
-            Notification.objects.create(
-                user=self.request.user,
-                notification_type=(
-                    Notification.NotificationType.RESERVATION_CONFIRMED
-                ),
-                title="Réservation confirmée",
-                message=(
-                    f"La réservation {reservation.reservation_number} "
-                    f"a été confirmée."
-                ),
-                reservation=reservation,
-            )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="confirmer"
+    description = models.TextField(
+        blank=True,
+        null=True,
     )
-    def confirmer(self, request, pk=None):
-        reservation = self.get_object()
-
-        if reservation.status == Reservation.Status.ANNULEE:
-            return Response(
-                {
-                    "detail": (
-                        "Une réservation annulée ne peut pas être confirmée."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        reservation.status = Reservation.Status.CONFIRMEE
-        reservation.save()
-
-        Notification.objects.create(
-            user=request.user,
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CONFIRMED
-            ),
-            title="Réservation confirmée",
-            message=(
-                f"La réservation {reservation.reservation_number} "
-                f"est maintenant confirmée."
-            ),
-            reservation=reservation,
-        )
-
-        return Response(
-            ReservationSerializer(
-                reservation,
-                context={"request": request}
-            ).data
-        )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="annuler"
+    capacity = models.PositiveIntegerField(
+        default=0,
     )
-    def annuler(self, request, pk=None):
-        reservation = self.get_object()
-
-        reservation.status = Reservation.Status.ANNULEE
-        reservation.save()
-
-        Notification.objects.create(
-            user=request.user,
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CANCELLED
-            ),
-            title="Réservation annulée",
-            message=(
-                f"La réservation {reservation.reservation_number} "
-                f"a été annulée."
-            ),
-            reservation=reservation,
-        )
-
-        return Response(
-            ReservationSerializer(reservation).data
-        )
-
-
-# ============================================================
-# RESERVATION SERVICES
-# ============================================================
-
-class ReservationServiceViewSet(viewsets.ModelViewSet):
-    queryset = ReservationService.objects.select_related(
-        "reservation",
-        "service"
-    ).all()
-
-    serializer_class = ReservationServiceSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# RESERVATION MATERIEL
-# ============================================================
-
-class ReservationMaterialViewSet(viewsets.ModelViewSet):
-    queryset = ReservationMaterial.objects.select_related(
-        "reservation",
-        "material"
-    ).all()
-
-    serializer_class = ReservationMaterialSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# COMPTES FINANCIERS
-# ============================================================
-
-class FinancialAccountViewSet(viewsets.ModelViewSet):
-    queryset = FinancialAccount.objects.all()
-    serializer_class = FinancialAccountSerializer
-    permission_classes = [IsAuthenticated]
-
-    @action(
-        detail=True,
-        methods=["get"],
-        url_path="solde"
-    )
-    def solde(self, request, pk=None):
-        account = self.get_object()
-
-        return Response(
-            {
-                "id": account.id,
-                "name": account.name,
-                "account_type": account.account_type,
-                "balance": account.balance,
-            }
-        )
-
-
-# ============================================================
-# PAIEMENTS
-# ============================================================
-
-class PaymentViewSet(viewsets.ModelViewSet):
-    queryset = Payment.objects.select_related(
-        "reservation",
-        "reservation__client",
-        "financial_account",
-        "created_by",
-    ).all()
-
-    serializer_class = PaymentSerializer
-    permission_classes = [IsAuthenticated]
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-
-        payment = serializer.save(
-            created_by=self.request.user
-        )
-
-        reservation = payment.reservation
-        account = payment.financial_account
-
-        # ----------------------------------------------------
-        # 1. RECALCUL DE LA RESERVATION
-        # ----------------------------------------------------
-
-        reservation.recalculate_financials()
-        reservation.save(
-            update_fields=[
-                "paid_amount",
-                "remaining_amount",
-                "payment_status",
-                "updated_at",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # 2. MOUVEMENT FINANCIER
-        # ----------------------------------------------------
-
-        CashMovement.objects.create(
-            account=account,
-            movement_type=CashMovement.MovementType.ENTREE,
-            amount=payment.amount,
-            description=(
-                f"Paiement {reservation.reservation_number} "
-                f"- {payment.amount}"
-            ),
-            payment=payment,
-            reservation=reservation,
-            created_by=self.request.user,
-        )
-
-        # ----------------------------------------------------
-        # 3. MISE A JOUR DU COMPTE
-        # ----------------------------------------------------
-
-        account.balance += payment.amount
-        account.save(update_fields=["balance"])
-
-        # ----------------------------------------------------
-        # 4. NOTIFICATION
-        # ----------------------------------------------------
-
-        if reservation.payment_status == Reservation.PaymentStatus.PAYE:
-            notification_type = (
-                Notification.NotificationType.PAYMENT_COMPLETED
-            )
-
-            title = "Paiement complet"
-
-            message = (
-                f"Le paiement de la réservation "
-                f"{reservation.reservation_number} "
-                f"est maintenant complet."
-            )
-
-        else:
-            notification_type = (
-                Notification.NotificationType.PAYMENT_PARTIAL
-            )
-
-            title = "Paiement reçu"
-
-            message = (
-                f"Un paiement de {payment.amount} a été reçu "
-                f"pour la réservation "
-                f"{reservation.reservation_number}. "
-                f"Reste à payer : {reservation.remaining_amount}."
-            )
-
-        Notification.objects.create(
-            user=self.request.user,
-            notification_type=notification_type,
-            title=title,
-            message=message,
-            reservation=reservation,
-            payment=payment,
-        )
-
-        # ----------------------------------------------------
-        # 5. GENERATION DU PDF DU PAIEMENT
-        # ----------------------------------------------------
-
-        try:
-            pdf_file = generate_payment_receipt_pdf(payment)
-
-            if pdf_file:
-                payment.receipt_pdf.save(
-                    f"recu-{payment.id}.pdf",
-                    pdf_file,
-                    save=True,
-                )
-
-        except Exception as error:
-            # Le paiement reste enregistré même si
-            # la génération du PDF échoue.
-            print(
-                f"Erreur génération reçu PDF : {error}"
-            )
-
-    @action(
-        detail=True,
-        methods=["get"],
-        url_path="recu"
-    )
-    def recu(self, request, pk=None):
-        payment = self.get_object()
-
-        if not payment.receipt_pdf:
-            return Response(
-                {
-                    "detail": "Aucun reçu PDF n'est disponible."
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        return Response(
-            {
-                "payment_id": payment.id,
-                "receipt_pdf": request.build_absolute_uri(
-                    payment.receipt_pdf.url
-                ),
-            }
-        )
-
-
-# ============================================================
-# DEPENSES
-# ============================================================
-
-class ExpenseViewSet(viewsets.ModelViewSet):
-    queryset = Expense.objects.select_related(
-        "financial_account",
-        "created_by",
-    ).all()
-
-    serializer_class = ExpenseSerializer
-    permission_classes = [IsAuthenticated]
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-
-        expense = serializer.save(
-            created_by=self.request.user
-        )
-
-        account = expense.financial_account
-
-        if account.balance < expense.amount:
-            raise ValueError(
-                "Solde insuffisant pour effectuer cette dépense."
-            )
-
-        account.balance -= expense.amount
-        account.save(update_fields=["balance"])
-
-        CashMovement.objects.create(
-            account=account,
-            movement_type=CashMovement.MovementType.SORTIE,
-            amount=expense.amount,
-            description=expense.description,
-            created_by=self.request.user,
-        )
-
-        Notification.objects.create(
-            user=self.request.user,
-            notification_type=(
-                Notification.NotificationType.EXPENSE_CREATED
-            ),
-            title="Dépense enregistrée",
-            message=(
-                f"Une dépense de {expense.amount} "
-                f"a été enregistrée."
-            ),
-        )
-
-
-# ============================================================
-# MOUVEMENTS FINANCIERS
-# ============================================================
-
-class CashMovementViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = CashMovement.objects.select_related(
-        "account",
-        "payment",
-        "reservation",
-        "created_by",
-    ).all()
-
-    serializer_class = CashMovementSerializer
-    permission_classes = [IsAuthenticated]
-
-
-# ============================================================
-# CONTRATS
-# ============================================================
-
-class ContractViewSet(viewsets.ModelViewSet):
-    queryset = Contract.objects.select_related(
-        "reservation",
-        "reservation__client",
-    ).all()
-
-    serializer_class = ContractSerializer
-    permission_classes = [IsAuthenticated]
-
-    def perform_create(self, serializer):
-        serializer.save(
-            uploaded_by=self.request.user
-        )
-
-
-# ============================================================
-# NOTIFICATIONS
-# ============================================================
-
-class NotificationViewSet(viewsets.ModelViewSet):
-    serializer_class = NotificationSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        return Notification.objects.filter(
-            user=self.request.user
-        ).select_related(
-            "reservation",
-            "payment",
-        )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="lire"
-    )
-    def lire(self, request, pk=None):
-        notification = self.get_object()
-
-        notification.is_read = True
-        notification.read_at = timezone.now()
-        notification.save(
-            update_fields=[
-                "is_read",
-                "read_at",
-            ]
-        )
-
-        return Response(
-            NotificationSerializer(notification).data
-        )
-
-
-
-# ============================================================
-# CALENDRIER
-# ============================================================
-
-# ============================================================
-# CALENDRIER
-# ============================================================
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def calendar_view(request, year, month):
-    """
-    Retourne les réservations d'un mois donné.
-
-    Exemple :
-    GET /api/calendar/2026/9/
-    """
-
-    # Vérification du mois
-    if month < 1 or month > 12:
-        return JsonResponse(
-            {
-                "detail": "Le mois doit être compris entre 1 et 12."
-            },
-            status=400,
-        )
-
-    reservations = (
-        Reservation.objects
-        .filter(
-            event_date__year=year,
-            event_date__month=month,
-        )
-        .select_related(
-            "client",
-            "hall",
-        )
-        .order_by(
-            "event_date",
-            "start_time",
-        )
-    )
-
-    data = []
-
-    for reservation in reservations:
-        data.append(
-            {
-                "id": reservation.id,
-                "reservation_number": reservation.reservation_number,
-
-                "client": (
-                    reservation.client.full_name
-                    if reservation.client
-                    else None
-                ),
-
-                "hall": (
-                    reservation.hall.name
-                    if reservation.hall
-                    else None
-                ),
-
-                "event_type": reservation.event_type,
-
-                "date": (
-                    reservation.event_date.isoformat()
-                    if reservation.event_date
-                    else None
-                ),
-
-                "start_time": (
-                    reservation.start_time.strftime("%H:%M")
-                    if reservation.start_time
-                    else None
-                ),
-
-                "end_time": (
-                    reservation.end_time.strftime("%H:%M")
-                    if reservation.end_time
-                    else None
-                ),
-
-                "guest_count": reservation.guest_count,
-
-                "total_amount": str(
-                    reservation.total_amount
-                ),
-
-                "paid_amount": str(
-                    reservation.paid_amount
-                ),
-
-                "remaining_amount": str(
-                    reservation.remaining_amount
-                ),
-
-                "payment_status": reservation.payment_status,
-
-                "status": reservation.status,
-            }
-        )
-
-    return JsonResponse(
-        {
-            "year": year,
-            "month": month,
-            "count": len(data),
-            "results": data,
-        }
-    )
-
-
-# ============================================================
-# SERVICE
-# ============================================================
-
-class Service(models.Model):
-    name = models.CharField(max_length=150, unique=True)
-    description = models.TextField(blank=True, null=True)
-
-    unit_price = models.DecimalField(
+    price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        default=Decimal("0.00")
+        default=Decimal("0.00"),
     )
-
-    is_active = models.BooleanField(default=True)
-
+    is_active = models.BooleanField(
+        default=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["name"]
+        verbose_name = "Salle"
+        verbose_name_plural = "Salles"
 
     def __str__(self):
         return self.name
 
 
+class HallImage(models.Model):
+    hall = models.ForeignKey(
+        Hall,
+        on_delete=models.CASCADE,
+        related_name="images",
+    )
+    image = models.ImageField(
+        upload_to="halls/images/",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    def __str__(self):
+        return f"Image - {self.hall.name}"
+
+
+class HallVideo(models.Model):
+    hall = models.ForeignKey(
+        Hall,
+        on_delete=models.CASCADE,
+        related_name="videos",
+    )
+    video = models.FileField(
+        upload_to="halls/videos/",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    def __str__(self):
+        return f"Vidéo - {self.hall.name}"
+
+
+# ============================================================
+# DEMANDE DE DEVIS
+# ============================================================
+class QuoteRequest(models.Model):
+    class Status(models.TextChoices):
+        EN_ATTENTE = "EN_ATTENTE", "En attente"
+        TRAITE = "TRAITE", "Traité"
+        REJETE = "REJETE", "Rejeté"
+
+    hall = models.ForeignKey(
+        Hall,
+        on_delete=models.CASCADE,
+        related_name="quote_requests",
+    )
+    client_name = models.CharField(
+        max_length=200,
+    )
+    client_email = models.EmailField()
+    client_phone = models.CharField(
+        max_length=50,
+    )
+    event_date = models.DateField()
+    message = models.TextField(
+        blank=True,
+        null=True,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.EN_ATTENTE,
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Demande de devis"
+        verbose_name_plural = "Demandes de devis"
+
+    def __str__(self):
+        return f"Devis {self.hall.name} - {self.client_name}"
+
+
 # ============================================================
 # MATERIEL
 # ============================================================
-
 class Material(models.Model):
-    name = models.CharField(max_length=150, unique=True)
-    description = models.TextField(blank=True, null=True)
+    class Etat(models.TextChoices):
+        ACTIF = "ACTIF", "Actif"
+        EN_REPARATION = "EN_REPARATION", "En réparation"
+        ABIME = "ABIME", "Abîmé"
 
-    quantity_available = models.PositiveIntegerField(default=0)
-
+    name = models.CharField(
+        max_length=150,
+        unique=True,
+    )
+    description = models.TextField(
+        blank=True,
+        null=True,
+    )
+    quantity_available = models.PositiveIntegerField(
+        default=0,
+    )
     unit_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        default=Decimal("0.00")
+        default=Decimal("0.00"),
     )
-
-    is_active = models.BooleanField(default=True)
-
+    etat = models.CharField(
+        max_length=30,
+        choices=Etat.choices,
+        default=Etat.ACTIF,
+    )
+    is_active = models.BooleanField(
+        default=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["name"]
+        verbose_name = "Matériel"
+        verbose_name_plural = "Matériel"
 
     def __str__(self):
         return self.name
+
+
+# ============================================================
+# PERSONNEL
+# ============================================================
+class Personnel(models.Model):
+    class Fonction(models.TextChoices):
+        GERANTE = "GERANTE", "Gérante"
+        AGENT_SECURITE = "AGENT_SECURITE", "Agent de sécurité"
+        DECORATEUR = "DECORATEUR", "Décorateur"
+        TECHNICIEN = "TECHNICIEN", "Technicien"
+        NETTOYEUR = "NETTOYEUR", "Nettoyeur"
+        SERVEUR = "SERVEUR", "Serveur"
+        RECEPTIONNISTE = "RECEPTIONNISTE", "Réceptionniste"
+        AUTRE = "AUTRE", "Autre"
+
+    class Statut(models.TextChoices):
+        ACTIF = "ACTIF", "Actif"
+        INACTIF = "INACTIF", "Inactif"
+
+    nom = models.CharField(max_length=100)
+    prenom = models.CharField(max_length=100)
+    telephone = models.CharField(
+        max_length=30,
+        blank=True,
+        null=True,
+    )
+    email = models.EmailField(
+        blank=True,
+        null=True,
+    )
+    fonction = models.CharField(
+        max_length=50,
+        choices=Fonction.choices,
+        default=Fonction.AUTRE,
+    )
+    statut = models.CharField(
+        max_length=20,
+        choices=Statut.choices,
+        default=Statut.ACTIF,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["nom", "prenom"]
+        verbose_name = "Personnel"
+        verbose_name_plural = "Personnel"
+
+    def __str__(self):
+        return f"{self.prenom} {self.nom}"
+
+
+# ============================================================
+# TARIFICATION
+# ============================================================
+class Tarif(models.Model):
+    name = models.CharField(
+        max_length=150,
+        unique=True,
+        verbose_name="Nom",
+    )
+    description = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="Description",
+    )
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Montant",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Actif",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Tarif"
+        verbose_name_plural = "Tarifs"
+
+    def __str__(self):
+        return f"{self.name} - {self.amount} $"
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount < Decimal("0.00"):
+            raise ValidationError("Le montant du tarif ne peut pas être négatif.")
 
 
 # ============================================================
 # RESERVATION
 # ============================================================
-
 class Reservation(models.Model):
-
     class Status(models.TextChoices):
         EN_ATTENTE = "EN_ATTENTE", "En attente"
         CONFIRMEE = "CONFIRMEE", "Confirmée"
@@ -758,410 +309,502 @@ class Reservation(models.Model):
         NON_PAYE = "NON_PAYE", "Non payé"
         PARTIEL = "PARTIEL", "Partiel"
         PAYE = "PAYE", "Payé"
+        REMBOURSE = "REMBOURSE", "Remboursé"
 
     client = models.ForeignKey(
         Client,
         on_delete=models.PROTECT,
-        related_name="reservations"
+        related_name="reservations",
     )
-
     hall = models.ForeignKey(
         Hall,
         on_delete=models.PROTECT,
-        related_name="reservations"
+        related_name="reservations",
     )
-
+    tarif = models.ForeignKey(
+        Tarif,
+        on_delete=models.PROTECT,
+        related_name="reservations",
+    )
     reservation_number = models.CharField(
         max_length=50,
         unique=True,
-        blank=True
+        blank=True,
     )
-
-    event_type = models.CharField(max_length=150)
-
+    event_type = models.CharField(
+        max_length=150,
+    )
     event_date = models.DateField()
-
     start_time = models.TimeField()
     end_time = models.TimeField()
-
-    guest_count = models.PositiveIntegerField(default=0)
-
-    description = models.TextField(blank=True, null=True)
-    observations = models.TextField(blank=True, null=True)
-
-    total_amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00")
+    guest_count = models.PositiveIntegerField(
+        default=0,
     )
-
-    paid_amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00")
-    )
-
-    remaining_amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00")
-    )
-
     payment_status = models.CharField(
         max_length=20,
         choices=PaymentStatus.choices,
-        default=PaymentStatus.NON_PAYE
+        default=PaymentStatus.NON_PAYE,
     )
-
     status = models.CharField(
         max_length=20,
         choices=Status.choices,
-        default=Status.EN_ATTENTE
+        default=Status.EN_ATTENTE,
     )
-
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="created_reservations"
+        related_name="created_reservations",
     )
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
 
     class Meta:
         ordering = ["-event_date", "start_time"]
+        verbose_name = "Réservation"
+        verbose_name_plural = "Réservations"
 
     def __str__(self):
         return f"{self.reservation_number} - {self.client.full_name}"
 
+    @property
+    def total_amount(self):
+        if self.tarif_id:
+            return self.tarif.amount or Decimal("0.00")
+        return Decimal("0.00")
+
+    @property
+    def paid_amount(self):
+        total = (
+            self.payments.filter(status=Payment.Status.VALIDE)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+        return total
+
+    @property
+    def refunded_amount(self):
+        total = (
+            self.refunds.aggregate(total=Sum("amount")).get("total")
+            or Decimal("0.00")
+        )
+        return total
+
+    @property
+    def net_paid_amount(self):
+        value = self.paid_amount - self.refunded_amount
+        return max(value, Decimal("0.00"))
+
+    @property
+    def remaining_amount(self):
+        remaining = self.total_amount - self.net_paid_amount
+        return max(remaining, Decimal("0.00"))
+
     def calculate_payment_status(self):
-        if self.paid_amount <= 0:
+        total = self.total_amount
+        paid = self.paid_amount
+        refunded = self.refunded_amount
+
+        if refunded > Decimal("0.00") and paid <= refunded:
+            return self.PaymentStatus.REMBOURSE
+        if paid <= Decimal("0.00"):
             return self.PaymentStatus.NON_PAYE
-
-        if self.paid_amount >= self.total_amount:
+        if paid >= total and refunded <= Decimal("0.00"):
             return self.PaymentStatus.PAYE
-
+        if refunded > Decimal("0.00"):
+            if self.net_paid_amount <= Decimal("0.00"):
+                return self.PaymentStatus.REMBOURSE
+            return self.PaymentStatus.PARTIEL
         return self.PaymentStatus.PARTIEL
 
     def recalculate_financials(self):
-        confirmed_total = self.payments.filter(
-            status=Payment.Status.CONFIRME
-        ).aggregate(
-            total=Sum("amount")
-        )["total"] or Decimal("0.00")
-
-        self.paid_amount = confirmed_total
-
-        self.remaining_amount = max(
-            self.total_amount - self.paid_amount,
-            Decimal("0.00")
-        )
-
-        self.payment_status = self.calculate_payment_status()
+        new_status = self.calculate_payment_status()
+        if self.payment_status != new_status:
+            self.payment_status = new_status
+            Reservation.objects.filter(pk=self.pk).update(
+                payment_status=new_status,
+                updated_at=timezone.now(),
+            )
+        return {
+            "total_amount": self.total_amount,
+            "paid_amount": self.paid_amount,
+            "refunded_amount": self.refunded_amount,
+            "remaining_amount": self.remaining_amount,
+            "payment_status": self.payment_status,
+        }
 
     def clean(self):
-        if self.start_time >= self.end_time:
+        super().clean()
+        if self.start_time and self.end_time and self.start_time >= self.end_time:
             raise ValidationError(
                 "L'heure de fin doit être supérieure à l'heure de début."
             )
+        if self.tarif_id and self.tarif.amount < Decimal("0.00"):
+            raise ValidationError("Le montant du tarif ne peut pas être négatif.")
 
-        if self.total_amount < 0:
-            raise ValidationError(
-                "Le montant total ne peut pas être négatif."
+        if self.hall_id and self.event_date:
+            conflicting_reservations = (
+                Reservation.objects.filter(
+                    hall=self.hall,
+                    event_date=self.event_date,
+                    start_time__lt=self.end_time,
+                    end_time__gt=self.start_time,
+                )
+                .exclude(pk=self.pk)
+                .exclude(
+                    status__in=[
+                        self.Status.ANNULEE,
+                        self.Status.TERMINEE,
+                        self.Status.CLOTUREE,
+                    ]
+                )
             )
-
-        conflicting_reservations = Reservation.objects.filter(
-            hall=self.hall,
-            event_date=self.event_date,
-            start_time__lt=self.end_time,
-            end_time__gt=self.start_time,
-        ).exclude(pk=self.pk).exclude(
-            status__in=[
-                self.Status.ANNULEE,
-                self.Status.TERMINEE,
-                self.Status.CLOTUREE,
-            ]
-        )
-
-        if conflicting_reservations.exists():
-            raise ValidationError(
-                "Cette salle est déjà réservée pour cette période."
-            )
+            if conflicting_reservations.exists():
+                raise ValidationError("Cette salle est déjà réservée pour cette période.")
 
     def save(self, *args, **kwargs):
+        if self.tarif_id:
+            self.event_type = self.tarif.name
+
         if not self.reservation_number:
             year = timezone.now().year
-
             last_reservation = (
-                Reservation.objects
-                .filter(reservation_number__startswith=f"RES-{year}-")
+                Reservation.objects.filter(
+                    reservation_number__startswith=f"RES-{year}-"
+                )
                 .order_by("-id")
                 .first()
             )
-
             number = 1
-
             if last_reservation:
                 try:
                     number = (
-                        int(last_reservation.reservation_number.split("-")[-1])
-                        + 1
+                        int(last_reservation.reservation_number.split("-")[-1]) + 1
                     )
                 except (ValueError, IndexError):
-                    number = self.__class__.objects.filter(
-                        reservation_number__startswith=f"RES-{year}-"
-                    ).count() + 1
-
+                    number = (
+                        Reservation.objects.filter(
+                            reservation_number__startswith=f"RES-{year}-"
+                        ).count()
+                        + 1
+                    )
             self.reservation_number = f"RES-{year}-{number:04d}"
 
-        if self.pk:
-            self.recalculate_financials()
-        else:
-            self.remaining_amount = self.total_amount
-            self.payment_status = self.PaymentStatus.NON_PAYE
-
+        self.full_clean()
         super().save(*args, **kwargs)
 
-
-# ============================================================
-# SERVICES D'UNE RESERVATION
-# ============================================================
-
-class ReservationService(models.Model):
-    reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.CASCADE,
-        related_name="reservation_services"
-    )
-
-    service = models.ForeignKey(
-        Service,
-        on_delete=models.PROTECT,
-        related_name="reservation_services"
-    )
-
-    quantity = models.PositiveIntegerField(default=1)
-
-    unit_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2
-    )
-
-    total_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00")
-    )
-
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def save(self, *args, **kwargs):
-        if not self.unit_price:
-            self.unit_price = self.service.unit_price
-
-        self.total_price = self.unit_price * self.quantity
-
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.service.name} - {self.reservation}"
-
-
-# ============================================================
-# MATERIEL D'UNE RESERVATION
-# ============================================================
-
-class ReservationMaterial(models.Model):
-    reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.CASCADE,
-        related_name="reservation_materials"
-    )
-
-    material = models.ForeignKey(
-        Material,
-        on_delete=models.PROTECT,
-        related_name="reservation_materials"
-    )
-
-    quantity = models.PositiveIntegerField(default=1)
-
-    unit_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2
-    )
-
-    total_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00")
-    )
-
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def save(self, *args, **kwargs):
-        if not self.unit_price:
-            self.unit_price = self.material.unit_price
-
-        self.total_price = self.unit_price * self.quantity
-
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.material.name} - {self.reservation}"
+        new_status = self.calculate_payment_status()
+        if self.payment_status != new_status:
+            Reservation.objects.filter(pk=self.pk).update(
+                payment_status=new_status,
+                updated_at=timezone.now(),
+            )
+            self.payment_status = new_status
 
 
 # ============================================================
 # COMPTES FINANCIERS
 # ============================================================
-
 class FinancialAccount(models.Model):
-
     class AccountType(models.TextChoices):
         CAISSE = "CAISSE", "Caisse"
         BANQUE = "BANQUE", "Banque"
         MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
 
-    name = models.CharField(max_length=150)
+    name = models.CharField(
+        max_length=150,
+    )
     account_type = models.CharField(
         max_length=30,
-        choices=AccountType.choices
+        choices=AccountType.choices,
     )
-
     balance = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        default=Decimal("0.00")
+        default=Decimal("0.00"),
     )
-
-    is_active = models.BooleanField(default=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(
+        default=True,
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
 
     class Meta:
         ordering = ["name"]
+        verbose_name = "Compte financier"
+        verbose_name_plural = "Comptes financiers"
 
     def __str__(self):
-        return f"{self.name} - {self.balance}"
+        return f"{self.name} - {self.balance} $"
 
 
 # ============================================================
-# PAIEMENTS
+# PAIEMENT
 # ============================================================
-
 class Payment(models.Model):
-
     class Method(models.TextChoices):
         ESPECES = "ESPECES", "Espèces"
-        VIREMENT = "VIREMENT_BANCAIRE", "Virement bancaire"
+        VIREMENT = "VIREMENT", "Virement bancaire"
         MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
-        CARTE = "CARTE", "Carte"
-        CHEQUE = "CHEQUE", "Chèque"
-        AUTRE = "AUTRE", "Autre"
 
     class Status(models.TextChoices):
         EN_ATTENTE = "EN_ATTENTE", "En attente"
-        CONFIRME = "CONFIRME", "Confirmé"
+        VALIDE = "VALIDE", "Validé"
         ANNULE = "ANNULE", "Annulé"
-        REMBOURSE = "REMBOURSE", "Remboursé"
 
     reservation = models.ForeignKey(
         Reservation,
-        on_delete=models.PROTECT,
-        related_name="payments"
-    )
-
-    amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2
-    )
-
-    payment_date = models.DateTimeField(default=timezone.now)
-
-    method = models.CharField(
-        max_length=30,
-        choices=Method.choices
-    )
-
-    reference = models.CharField(
-        max_length=150,
+        on_delete=models.CASCADE,
+        related_name="payments",
         blank=True,
-        null=True
+        null=True,
     )
-
-    operator = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True
-    )
-
     financial_account = models.ForeignKey(
         FinancialAccount,
-        on_delete=models.PROTECT,
-        related_name="payments"
+        on_delete=models.SET_NULL,
+        related_name="payments",
+        blank=True,
+        null=True,
     )
-
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+    payment_date = models.DateTimeField(
+        default=timezone.now,
+    )
+    method = models.CharField(
+        max_length=30,
+        choices=Method.choices,
+        default=Method.ESPECES,
+    )
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+    )
+    operator = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True,
+    )
     status = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=Status.choices,
-        default=Status.CONFIRME
+        default=Status.VALIDE,
     )
-
     receipt_pdf = models.FileField(
         upload_to="payments/receipts/",
         blank=True,
-        null=True
+        null=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="created_payments",
+        blank=True,
+        null=True,
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
     )
 
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Paiement"
+        verbose_name_plural = "Paiements"
+
+    def clean(self):
+        super().clean()
+
+        if self.amount is not None:
+            if self.amount <= Decimal("0.00"):
+                raise ValidationError(
+                    "Le montant du paiement doit être supérieur à zéro."
+                )
+
+        # Anti-double paiement / sur-paiement
+        if self.reservation and self.amount:
+            remaining = self.reservation.remaining_amount
+            # Si c'est une modification, on rajoute temporairement l'ancien montant
+            if self.pk:
+                old_payment = Payment.objects.filter(pk=self.pk).first()
+                if old_payment and old_payment.status == self.Status.VALIDE:
+                    remaining += old_payment.amount
+
+            if remaining <= Decimal("0.00"):
+                raise ValidationError(
+                    "Cette réservation est déjà entièrement payée. Aucun paiement supplémentaire n'est autorisé."
+                )
+
+            if self.amount > remaining:
+                raise ValidationError(
+                    f"Le montant du paiement ({self.amount} $) dépasse le solde restant à payer ({remaining} $)."
+                )
+
+        if self.financial_account:
+            if (
+                self.financial_account.account_type == FinancialAccount.AccountType.CAISSE
+                and self.method != self.Method.ESPECES
+            ):
+                raise ValidationError(
+                    "La caisse physique ne peut recevoir que les paiements en espèces."
+                )
+            if (
+                self.financial_account.account_type == FinancialAccount.AccountType.BANQUE
+                and self.method != self.Method.VIREMENT
+            ):
+                raise ValidationError(
+                    "Le compte bancaire doit être associé à un virement bancaire."
+                )
+            if (
+                self.financial_account.account_type == FinancialAccount.AccountType.MOBILE_MONEY
+                and self.method != self.Method.MOBILE_MONEY
+            ):
+                raise ValidationError(
+                    "Le compte Mobile Money doit être associé à un paiement Mobile Money."
+                )
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+        if is_new and self.status == self.Status.VALIDE and self.financial_account:
+            self.financial_account.balance += self.amount
+            self.financial_account.save(update_fields=["balance"])
+
+            CashMovement.objects.create(
+                account=self.financial_account,
+                movement_type=CashMovement.MovementType.ENTREE,
+                amount=self.amount,
+                description=(
+                    f"Paiement reçu pour réservation {self.reservation.reservation_number}"
+                    if self.reservation
+                    else "Paiement reçu"
+                ),
+                payment=self,
+                reservation=self.reservation,
+                created_by=self.created_by,
+            )
+
+        if self.reservation_id:
+            self.reservation.recalculate_financials()
+
+    def __str__(self):
+        if self.reservation:
+            return f"Paiement #{self.id} - {self.reservation.reservation_number}"
+        return f"Paiement #{self.id}"
+
+
+# ============================================================
+# REMBOURSEMENT
+# ============================================================
+class Refund(models.Model):
+    reservation = models.ForeignKey(
+        Reservation,
+        on_delete=models.CASCADE,
+        related_name="refunds",
+    )
+    financial_account = models.ForeignKey(
+        FinancialAccount,
+        on_delete=models.PROTECT,
+        related_name="refunds",
+    )
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+    reason = models.TextField(
+        blank=True,
+        null=True,
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="created_payments"
+        related_name="created_refunds",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
-
     class Meta:
-        ordering = ["-payment_date"]
-
-    def __str__(self):
-        return f"{self.reservation.reservation_number} - {self.amount}"
+        ordering = ["-created_at"]
+        verbose_name = "Remboursement"
+        verbose_name_plural = "Remboursements"
 
     def clean(self):
-        if self.amount <= 0:
+        super().clean()
+        if self.amount is None or self.amount <= Decimal("0.00"):
             raise ValidationError(
-                "Le montant du paiement doit être supérieur à zéro."
+                "Le montant du remboursement doit être supérieur à zéro."
             )
 
-        if self.financial_account.account_type == FinancialAccount.AccountType.CAISSE:
-            if self.method != self.Method.ESPECES:
-                raise ValidationError(
-                    "La caisse physique ne peut recevoir que les paiements en espèces."
-                )
+        already_refunded = (
+            self.reservation.refunds.exclude(pk=self.pk)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
 
-        if self.financial_account.account_type == FinancialAccount.AccountType.BANQUE:
-            if self.method != self.Method.VIREMENT:
-                raise ValidationError(
-                    "Le compte bancaire doit être associé à un virement bancaire."
-                )
+        max_refundable = self.reservation.paid_amount - already_refunded
 
-        if self.financial_account.account_type == FinancialAccount.AccountType.MOBILE_MONEY:
-            if self.method != self.Method.MOBILE_MONEY:
-                raise ValidationError(
-                    "Le compte Mobile Money doit être associé à un paiement Mobile Money."
-                )
+        if self.amount > max_refundable:
+            raise ValidationError(
+                f"Le montant à rembourser ({self.amount} $) dépasse le montant disponible ({max_refundable} $)."
+            )
+
+        if self.financial_account and self.financial_account.balance < self.amount:
+            raise ValidationError(
+                "Solde du compte insuffisant pour effectuer ce remboursement."
+            )
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+        if is_new:
+            self.financial_account.balance -= self.amount
+            self.financial_account.save(update_fields=["balance"])
+
+            CashMovement.objects.create(
+                account=self.financial_account,
+                movement_type=CashMovement.MovementType.REMBOURSEMENT,
+                amount=self.amount,
+                description=(
+                    f"Remboursement client : {self.reservation.reservation_number}. "
+                    f"Motif : {self.reason or 'N/A'}"
+                ),
+                reservation=self.reservation,
+                created_by=self.created_by,
+            )
+
+        self.reservation.recalculate_financials()
+
+        if self.reservation.payment_status == Reservation.PaymentStatus.REMBOURSE:
+            self.reservation.status = Reservation.Status.ANNULEE
+            self.reservation.save()
+
+    def __str__(self):
+        return f"Remboursement {self.amount} $ - {self.reservation.reservation_number}"
 
 
 # ============================================================
 # MOUVEMENTS FINANCIERS
 # ============================================================
-
 class CashMovement(models.Model):
-
     class MovementType(models.TextChoices):
         ENTREE = "ENTREE", "Entrée"
         SORTIE = "SORTIE", "Sortie"
@@ -1172,186 +815,221 @@ class CashMovement(models.Model):
     account = models.ForeignKey(
         FinancialAccount,
         on_delete=models.PROTECT,
-        related_name="movements"
+        related_name="movements",
     )
-
     movement_type = models.CharField(
         max_length=30,
-        choices=MovementType.choices
+        choices=MovementType.choices,
     )
-
     amount = models.DecimalField(
         max_digits=14,
-        decimal_places=2
+        decimal_places=2,
     )
-
-    description = models.CharField(max_length=255)
-
+    description = models.CharField(
+        max_length=255,
+    )
     payment = models.ForeignKey(
         Payment,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
-        related_name="movements"
+        related_name="movements",
     )
-
     reservation = models.ForeignKey(
         Reservation,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
-        related_name="financial_movements"
+        related_name="financial_movements",
     )
-
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="created_movements"
+        related_name="created_movements",
     )
-
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name = "Mouvement de caisse"
+        verbose_name_plural = "Mouvements de caisse"
 
     def __str__(self):
-        return f"{self.movement_type} - {self.amount}"
+        return f"{self.movement_type} - {self.amount} $"
 
 
 # ============================================================
 # DEPENSES
 # ============================================================
-
 class Expense(models.Model):
+    class ExpenseType(models.TextChoices):
+        EAU = "EAU", "Eau"
+        ELECTRICITE = "ELECTRICITE", "Électricité"
+        SALAIRE = "SALAIRE", "Salaire"
+        AUTRE = "AUTRE", "Autre"
 
-    category = models.CharField(max_length=150)
-
+    category = models.CharField(
+        max_length=150,
+        choices=ExpenseType.choices,
+        default=ExpenseType.AUTRE,
+    )
     description = models.TextField()
-
     amount = models.DecimalField(
         max_digits=12,
-        decimal_places=2
+        decimal_places=2,
     )
-
-    expense_date = models.DateTimeField(default=timezone.now)
-
+    expense_date = models.DateTimeField(
+        default=timezone.now,
+    )
     financial_account = models.ForeignKey(
         FinancialAccount,
         on_delete=models.PROTECT,
-        related_name="expenses"
+        related_name="expenses",
+        null=True,
+        blank=True,
     )
-
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="created_expenses"
+        related_name="created_expenses",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    class Meta:
+        ordering = ["-expense_date"]
+        verbose_name = "Dépense"
+        verbose_name_plural = "Dépenses"
+
+    def clean(self):
+        super().clean()
+
+        if self.amount is not None and self.amount <= Decimal("0.00"):
+            raise ValidationError(
+                "Le montant de la dépense doit être supérieur à zéro."
+            )
+
+        # Récupération automatique de la caisse principale si le compte n'est pas spécifié
+        if not self.financial_account:
+            caisse_account = FinancialAccount.objects.filter(
+                account_type=FinancialAccount.AccountType.CAISSE,
+                is_active=True,
+            ).first()
+
+            if not caisse_account:
+                raise ValidationError(
+                    "Aucun compte de Caisse actif n'a été trouvé dans le système."
+                )
+            self.financial_account = caisse_account
+
+        # Récupération du total/solde de la caisse et validation du montant
+        caisse_balance = self.financial_account.balance
+        if self.amount and caisse_balance < self.amount:
+            raise ValidationError(
+                f"Opération impossible : Le montant de la dépense ({self.amount} $) "
+                f"est supérieur au solde disponible en Caisse ({caisse_balance} $)."
+            )
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+        if is_new and self.financial_account:
+            self.financial_account.balance -= self.amount
+            self.financial_account.save(update_fields=["balance"])
+
+            CashMovement.objects.create(
+                account=self.financial_account,
+                movement_type=CashMovement.MovementType.SORTIE,
+                amount=self.amount,
+                description=(
+                    f"Dépense [{self.get_category_display()}] : "
+                    f"{self.description[:100]}"
+                ),
+                created_by=self.created_by,
+            )
 
     def __str__(self):
-        return f"{self.category} - {self.amount}"
+        return f"{self.category} - {self.amount} $"
 
 
 # ============================================================
-# CONTRAT / DOCUMENT
+# CONTRAT
 # ============================================================
-
 class Contract(models.Model):
     reservation = models.OneToOneField(
         Reservation,
         on_delete=models.CASCADE,
-        related_name="contract"
+        related_name="contract",
     )
-
     file = models.FileField(
-        upload_to="contracts/"
+        upload_to="contracts/",
     )
-
     signed_at = models.DateTimeField(
         null=True,
-        blank=True
+        blank=True,
     )
-
     uploaded_at = models.DateTimeField(
-        auto_now_add=True
+        auto_now_add=True,
     )
-
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
-        blank=True
+        blank=True,
     )
+
+    class Meta:
+        verbose_name = "Contrat"
+        verbose_name_plural = "Contrats"
 
     def __str__(self):
         return f"Contrat - {self.reservation.reservation_number}"
 
 
 # ============================================================
-# NOTIFICATIONS
+# NOTIFICATION
 # ============================================================
-
 class Notification(models.Model):
-
     class NotificationType(models.TextChoices):
-        RESERVATION_CREATED = "RESERVATION_CREATED", "Nouvelle réservation"
-        RESERVATION_CONFIRMED = "RESERVATION_CONFIRMED", "Réservation confirmée"
-        RESERVATION_CANCELLED = "RESERVATION_CANCELLED", "Réservation annulée"
-        PAYMENT_RECEIVED = "PAYMENT_RECEIVED", "Paiement reçu"
-        PAYMENT_PARTIAL = "PAYMENT_PARTIAL", "Paiement partiel"
-        PAYMENT_COMPLETED = "PAYMENT_COMPLETED", "Paiement complet"
-        PAYMENT_REFUNDED = "PAYMENT_REFUNDED", "Paiement remboursé"
-        EXPENSE_CREATED = "EXPENSE_CREATED", "Dépense enregistrée"
-        EVENT_UPCOMING = "EVENT_UPCOMING", "Événement imminent"
-        SYSTEM = "SYSTEM", "Système"
+        RESERVATION = "RESERVATION", "Réservation"
+        PAIEMENT = "PAIEMENT", "Paiement"
+        DEPENSE = "DEPENSE", "Dépense"
+        SYSTEME = "SYSTEME", "Système"
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="notifications"
+        related_name="notifications",
+        null=True,
+        blank=True,
     )
-
-    notification_type = models.CharField(
-        max_length=50,
-        choices=NotificationType.choices
-    )
-
     title = models.CharField(max_length=200)
-
     message = models.TextField()
-
+    notification_type = models.CharField(
+        max_length=30,
+        choices=NotificationType.choices,
+        default=NotificationType.SYSTEME,
+    )
     is_read = models.BooleanField(default=False)
-
-    read_at = models.DateTimeField(
-        null=True,
-        blank=True
-    )
-
-    reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="notifications"
-    )
-
-    payment = models.ForeignKey(
-        Payment,
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="notifications"
-    )
-
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name = "Notification"
+        verbose_name_plural = "Notifications"
 
     def __str__(self):
-        return self.title
+        return f"{self.title} - {self.user}"

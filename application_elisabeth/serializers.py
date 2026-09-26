@@ -1,212 +1,375 @@
-from decimal import Decimal
+﻿from django.db.models import Count
+from rest_framework import serializers
 
 from django.db import transaction
-from rest_framework import serializers
 
 from .models import (
     Client,
     Hall,
-    Service,
     Material,
     Reservation,
-    ReservationService,
-    ReservationMaterial,
     FinancialAccount,
     Payment,
     CashMovement,
     Expense,
     Contract,
     Notification,
+    Personnel,
+    Refund,Hall, 
+    HallImage, 
+    HallVideo,
+    Tarif,
 )
-
 
 # ============================================================
 # CLIENT
 # ============================================================
 
 class ClientSerializer(serializers.ModelSerializer):
+    reservations_count = serializers.IntegerField(
+        read_only=True
+    )
+
     class Meta:
         model = Client
-        fields = "__all__"
 
+        fields = [
+            "id",
+            "full_name",
+            "phone",
+            "email",
+            "address",
+            "notes",
+            "reservations_count",
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "reservations_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_phone(self, value):
+        value = (
+            value.strip()
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("(", "")
+            .replace(")", "")
+        )
+
+        if not value:
+            raise serializers.ValidationError(
+                "Le numéro de téléphone est obligatoire."
+            )
+
+        queryset = Client.objects.filter(
+            phone=value
+        )
+
+        if self.instance:
+            queryset = queryset.exclude(
+                pk=self.instance.pk
+            )
+
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "Un client existe déjà avec ce numéro de téléphone."
+            )
+
+        return value
 
 # ============================================================
-# SALLE
+# HALL
 # ============================================================
+
+class HallImageSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HallImage
+        fields = [
+            "id",
+            "image",
+            "url",
+            "created_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "url",
+            "created_at",
+        ]
+
+    def get_url(self, obj):
+        if not obj.image:
+            return None
+
+        request = self.context.get("request")
+        url = obj.image.url
+
+        if request:
+            return request.build_absolute_uri(url)
+
+        return url
+
+
+class HallVideoSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HallVideo
+        fields = [
+            "id",
+            "video",
+            "url",
+            "created_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "url",
+            "created_at",
+        ]
+
+    def get_url(self, obj):
+        if not obj.video:
+            return None
+
+        request = self.context.get("request")
+        url = obj.video.url
+
+        if request:
+            return request.build_absolute_uri(url)
+
+        return url
+
 
 class HallSerializer(serializers.ModelSerializer):
+    images = HallImageSerializer(
+        many=True,
+        read_only=True
+    )
+
+    videos = HallVideoSerializer(
+        many=True,
+        read_only=True
+    )
+
     class Meta:
         model = Hall
-        fields = "__all__"
 
+        fields = [
+            "id",
+            "name",
+            "description",
+            "capacity",
+            "price",
+            "is_active",
+            "images",
+            "videos",
+            "created_at",
+            "updated_at",
+        ]
 
-# ============================================================
-# SERVICE
-# ============================================================
+        read_only_fields = [
+            "id",
+            "images",
+            "videos",
+            "created_at",
+            "updated_at",
+        ]
 
-class ServiceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Service
-        fields = "__all__"
+    def validate_name(self, value):
+        value = value.strip()
 
+        if not value:
+            raise serializers.ValidationError(
+                "Le nom de la salle est obligatoire."
+            )
 
+        return value
+
+    def validate_capacity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError(
+                "La capacité doit être supérieure à 0."
+            )
+
+        return value
+
+    def validate_price(self, value):
+        if value < 0:
+            raise serializers.ValidationError(
+                "Le prix ne peut pas être négatif."
+            )
+
+        return value
 # ============================================================
 # MATERIEL
 # ============================================================
 
 class MaterialSerializer(serializers.ModelSerializer):
+
+    etat_label = serializers.CharField(
+        source="get_etat_display",
+        read_only=True
+    )
+
     class Meta:
         model = Material
-        fields = "__all__"
 
-
-# ============================================================
-# RESERVATION SERVICE
-# ============================================================
-
-class ReservationServiceSerializer(serializers.ModelSerializer):
-    service_name = serializers.CharField(
-        source="service.name",
-        read_only=True
-    )
-
-    class Meta:
-        model = ReservationService
-        fields = "__all__"
-
-
-# ============================================================
-# RESERVATION MATERIAL
-# ============================================================
-
-class ReservationMaterialSerializer(serializers.ModelSerializer):
-    material_name = serializers.CharField(
-        source="material.name",
-        read_only=True
-    )
-
-    class Meta:
-        model = ReservationMaterial
-        fields = "__all__"
-
-
-# ============================================================
-# PAIEMENT
-# ============================================================
-
-class PaymentSerializer(serializers.ModelSerializer):
-    reservation_number = serializers.CharField(
-        source="reservation.reservation_number",
-        read_only=True
-    )
-
-    client_name = serializers.CharField(
-        source="reservation.client.full_name",
-        read_only=True
-    )
-
-    account_name = serializers.CharField(
-        source="financial_account.name",
-        read_only=True
-    )
-
-    class Meta:
-        model = Payment
         fields = [
             "id",
-            "reservation",
-            "reservation_number",
-            "client_name",
-            "amount",
-            "payment_date",
-            "method",
-            "reference",
-            "operator",
-            "financial_account",
-            "account_name",
-            "status",
-            "receipt_pdf",
-            "created_by",
+            "name",
+            "description",
+            "quantity_available",
+            "unit_price",
+            "etat",
+            "etat_label",
+            "is_active",
             "created_at",
+            "updated_at",
         ]
 
         read_only_fields = [
-            "created_by",
-            "receipt_pdf",
+            "id",
+            "etat_label",
+            "created_at",
+            "updated_at",
         ]
 
-    def validate(self, attrs):
-        reservation = attrs["reservation"]
-        amount = attrs["amount"]
 
-        if amount <= 0:
-            raise serializers.ValidationError(
-                "Le montant du paiement doit être supérieur à zéro."
-            )
+# ============================================================
+# PERSONNEL
+# ============================================================
 
-        if reservation.status == Reservation.Status.ANNULEE:
-            raise serializers.ValidationError(
-                "Impossible d'enregistrer un paiement sur une réservation annulée."
-            )
+class PersonnelSerializer(serializers.ModelSerializer):
 
-        if reservation.status in [
-            Reservation.Status.TERMINEE,
-            Reservation.Status.CLOTUREE,
-        ]:
-            raise serializers.ValidationError(
-                "Cette réservation est terminée ou clôturée."
-            )
+    class Meta:
+        model = Personnel
+        fields = "__all__"
 
-        current_paid = reservation.paid_amount
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+        ]
 
-        if current_paid + amount > reservation.total_amount:
-            raise serializers.ValidationError(
-                {
-                    "amount": (
-                        f"Le paiement dépasse le solde restant. "
-                        f"Reste à payer : {reservation.remaining_amount}"
-                    )
-                }
-            )
 
-        return attrs
 
 
 # ============================================================
 # RESERVATION
 # ============================================================
 
+
+
+
 class ReservationSerializer(serializers.ModelSerializer):
+    # ---------------------------------------------------------
+    # INFORMATIONS CLIENT ENTRANTES
+    # ---------------------------------------------------------
+
+    client_full_name = serializers.CharField(
+        write_only=True,
+        required=True
+    )
+
+    client_phone = serializers.CharField(
+        write_only=True,
+        required=True
+    )
+
+    client_email = serializers.EmailField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        allow_null=True
+    )
+
+    client_address = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        allow_null=True
+    )
+
+    # ---------------------------------------------------------
+    # INFORMATIONS CLIENT SORTANTES
+    # ---------------------------------------------------------
 
     client_name = serializers.CharField(
         source="client.full_name",
         read_only=True
     )
 
+    client_phone_display = serializers.CharField(
+        source="client.phone",
+        read_only=True
+    )
+
+    # ---------------------------------------------------------
+    # INFORMATIONS SALLE
+    # ---------------------------------------------------------
+
     hall_name = serializers.CharField(
         source="hall.name",
         read_only=True
     )
 
-    payments = PaymentSerializer(
-        many=True,
+    # ---------------------------------------------------------
+    # INFORMATIONS TARIF
+    # ---------------------------------------------------------
+
+    tarif_name = serializers.CharField(
+        source="tarif.name",
         read_only=True
     )
 
-    services = ReservationServiceSerializer(
-        source="reservation_services",
-        many=True,
+    tarif_amount = serializers.DecimalField(
+        source="tarif.amount",
+        max_digits=12,
+        decimal_places=2,
         read_only=True
     )
 
-    materials = ReservationMaterialSerializer(
-        source="reservation_materials",
-        many=True,
+    # ---------------------------------------------------------
+    # MONTANTS
+    # ---------------------------------------------------------
+
+    total_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
         read_only=True
     )
 
-    contract_file = serializers.FileField(
-        source="contract.file",
+    paid_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    remaining_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    # ---------------------------------------------------------
+    # PAIEMENT
+    # ---------------------------------------------------------
+
+    payment_status_display = serializers.CharField(
+        source="get_payment_status_display",
+        read_only=True
+    )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
         read_only=True
     )
 
@@ -215,128 +378,413 @@ class ReservationSerializer(serializers.ModelSerializer):
 
         fields = [
             "id",
+
+            # Identification
             "reservation_number",
+
+            # Client
             "client",
             "client_name",
+            "client_phone_display",
+            "client_full_name",
+            "client_phone",
+            "client_email",
+            "client_address",
+
+            # Salle
             "hall",
             "hall_name",
+
+            # Tarif
+            "tarif",
+            "tarif_name",
+            "tarif_amount",
+
+            # Événement
             "event_type",
             "event_date",
             "start_time",
             "end_time",
             "guest_count",
-            "description",
-            "observations",
+
+            # Statuts
+            "status",
+            "status_display",
+            "payment_status",
+            "payment_status_display",
+
+            # Finances
             "total_amount",
             "paid_amount",
             "remaining_amount",
-            "payment_status",
-            "status",
-            "payments",
-            "services",
-            "materials",
-            "contract_file",
-            "created_by",
+
+            # Dates
             "created_at",
             "updated_at",
         ]
 
         read_only_fields = [
+            "id",
             "reservation_number",
+            "client",
+            "event_type",
+            "payment_status",
+            "total_amount",
             "paid_amount",
             "remaining_amount",
-            "payment_status",
-            "created_by",
+            "created_at",
+            "updated_at",
         ]
 
+    # =========================================================
+    # VALIDATION
+    # =========================================================
+
     def validate(self, attrs):
-        instance = self.instance
+        start_time = attrs.get("start_time")
+        end_time = attrs.get("end_time")
 
-        reservation = Reservation(
-            client=attrs.get(
-                "client",
-                instance.client if instance else None
-            ),
-            hall=attrs.get(
-                "hall",
-                instance.hall if instance else None
-            ),
-            event_date=attrs.get(
-                "event_date",
-                instance.event_date if instance else None
-            ),
-            start_time=attrs.get(
-                "start_time",
-                instance.start_time if instance else None
-            ),
-            end_time=attrs.get(
-                "end_time",
-                instance.end_time if instance else None
-            ),
-            total_amount=attrs.get(
-                "total_amount",
-                instance.total_amount if instance else Decimal("0.00")
-            ),
-        )
+        if start_time and end_time and start_time >= end_time:
+            raise serializers.ValidationError({
+                "end_time": (
+                    "L'heure de fin doit être supérieure "
+                    "à l'heure de début."
+                )
+            })
 
-        if instance:
-            reservation.pk = instance.pk
+        hall = attrs.get("hall")
+        event_date = attrs.get("event_date")
 
-        reservation.clean()
+        if hall and event_date and start_time and end_time:
+
+            reservation_id = self.instance.pk if self.instance else None
+
+            conflicts = Reservation.objects.filter(
+                hall=hall,
+                event_date=event_date,
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            ).exclude(
+                status__in=[
+                    Reservation.Status.ANNULEE,
+                    Reservation.Status.TERMINEE,
+                    Reservation.Status.CLOTUREE,
+                ]
+            )
+
+            if reservation_id:
+                conflicts = conflicts.exclude(
+                    pk=reservation_id
+                )
+
+            if conflicts.exists():
+                raise serializers.ValidationError({
+                    "hall": (
+                        "Cette salle est déjà réservée "
+                        "pour cette période."
+                    )
+                })
 
         return attrs
 
+    # =========================================================
+    # CREATION
+    # =========================================================
+
+    @transaction.atomic
+    def create(self, validated_data):
+
+        # -----------------------------------------------------
+        # Récupération des informations client
+        # -----------------------------------------------------
+
+        full_name = validated_data.pop(
+            "client_full_name"
+        ).strip()
+
+        phone = validated_data.pop(
+            "client_phone"
+        ).strip()
+
+        email = validated_data.pop(
+            "client_email",
+            None
+        )
+
+        address = validated_data.pop(
+            "client_address",
+            None
+        )
+
+        if email:
+            email = email.strip()
+
+        if address:
+            address = address.strip()
+
+        # -----------------------------------------------------
+        # Recherche du client par téléphone
+        # -----------------------------------------------------
+
+        client = Client.objects.filter(
+            phone=phone
+        ).first()
+
+        if client:
+            # Mise à jour des informations existantes
+            client.full_name = full_name
+
+            if email is not None:
+                client.email = email
+
+            if address is not None:
+                client.address = address
+
+            client.save()
+
+        else:
+            # Création automatique du client
+            client = Client.objects.create(
+                full_name=full_name,
+                phone=phone,
+                email=email,
+                address=address,
+            )
+
+        # -----------------------------------------------------
+        # Création de la réservation
+        # -----------------------------------------------------
+
+        reservation = Reservation.objects.create(
+            client=client,
+            **validated_data
+        )
+
+        return reservation
+
+    # =========================================================
+    # UPDATE
+    # =========================================================
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+
+        client_full_name = validated_data.pop(
+            "client_full_name",
+            None
+        )
+
+        client_phone = validated_data.pop(
+            "client_phone",
+            None
+        )
+
+        client_email = validated_data.pop(
+            "client_email",
+            None
+        )
+
+        client_address = validated_data.pop(
+            "client_address",
+            None
+        )
+
+        # -----------------------------------------------------
+        # Mise à jour du client
+        # -----------------------------------------------------
+
+        client = instance.client
+
+        if client_full_name is not None:
+            client.full_name = client_full_name.strip()
+
+        if client_phone is not None:
+            new_phone = client_phone.strip()
+
+            # Vérifier qu'un autre client n'utilise pas
+            # déjà ce numéro
+            duplicate = Client.objects.filter(
+                phone=new_phone
+            ).exclude(
+                pk=client.pk
+            ).exists()
+
+            if duplicate:
+                raise serializers.ValidationError({
+                    "client_phone": (
+                        "Un autre client utilise déjà "
+                        "ce numéro de téléphone."
+                    )
+                })
+
+            client.phone = new_phone
+
+        if client_email is not None:
+            client.email = client_email.strip()
+
+        if client_address is not None:
+            client.address = client_address.strip()
+
+        client.save()
+
+        # -----------------------------------------------------
+        # Mise à jour réservation
+        # -----------------------------------------------------
+
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+
+        instance.save()
+
+        return instance
+
+
+
+
+
+
+
+class TarifSerializer(serializers.ModelSerializer):
+
+    class Meta:
+
+        model = Tarif
+
+        fields = [
+            "id",
+            "name",
+            "description",
+            "amount",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+        ]
+
 
 # ============================================================
-# COMPTES FINANCIERS
+# FINANCIAL ACCOUNT
 # ============================================================
 
 class FinancialAccountSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = FinancialAccount
         fields = "__all__"
 
-        read_only_fields = [
-            "balance",
+
+# ============================================================
+# PAYMENT
+# ============================================================
+
+class PaymentSerializer(serializers.ModelSerializer):
+
+    reservation_number = serializers.CharField(
+        source="reservation.reservation_number",
+        read_only=True,
+    )
+
+    client = ClientSerializer(
+        source="reservation.client",
+        read_only=True,
+    )
+
+    class Meta:
+
+        model = Payment
+
+        fields = [
+            "id",
+            "reservation",
+            "reservation_number",
+            "client",
+            "financial_account",
+            "amount",
+            "payment_date",
+            "method",
+            "reference",
+            "operator",
+            "status",
+            "receipt_pdf",
+            "created_by",
+            "created_at",
         ]
+
+        read_only_fields = [
+            "id",
+            "reservation_number",
+            "client",
+            "created_by",
+            "created_at",
+        ]
+
+    def create(
+        self,
+        validated_data,
+    ):
+
+        request = self.context.get(
+            "request"
+        )
+
+        if (
+            request
+            and request.user
+            and request.user.is_authenticated
+        ):
+            validated_data["created_by"] = request.user
+
+        return super().create(
+            validated_data
+        )
 
 
 # ============================================================
-# MOUVEMENTS
+# CASH MOVEMENT
 # ============================================================
 
 class CashMovementSerializer(serializers.ModelSerializer):
-    account_name = serializers.CharField(
-        source="account.name",
-        read_only=True
-    )
 
     class Meta:
         model = CashMovement
         fields = "__all__"
 
         read_only_fields = [
-            "created_by",
+            "id",
+            "created_at",
         ]
 
 
-# ============================================================
-# DEPENSES
-# ============================================================
+
+
+
+
 
 class ExpenseSerializer(serializers.ModelSerializer):
 
+    category_display = serializers.CharField(
+        source="get_category_display",
+        read_only=True,
+    )
+
     account_name = serializers.CharField(
         source="financial_account.name",
-        read_only=True
+        read_only=True,
     )
 
     class Meta:
+
         model = Expense
 
         fields = [
             "id",
             "category",
+            "category_display",
             "description",
             "amount",
             "expense_date",
@@ -344,56 +792,103 @@ class ExpenseSerializer(serializers.ModelSerializer):
             "account_name",
             "created_by",
             "created_at",
+            "updated_at",
         ]
 
         read_only_fields = [
+            "id",
+            "financial_account",
+            "account_name",
             "created_by",
+            "created_at",
+            "updated_at",
         ]
 
 
 # ============================================================
-# CONTRAT
+# CONTRACT
 # ============================================================
 
 class ContractSerializer(serializers.ModelSerializer):
 
-    reservation_number = serializers.CharField(
-        source="reservation.reservation_number",
-        read_only=True
-    )
-
     class Meta:
         model = Contract
-
-        fields = [
-            "id",
-            "reservation",
-            "reservation_number",
-            "file",
-            "signed_at",
-            "uploaded_at",
-            "uploaded_by",
-        ]
-
-        read_only_fields = [
-            "uploaded_by",
-            "uploaded_at",
-        ]
-
-
-# ============================================================
-# NOTIFICATIONS
-# ============================================================
-
-class NotificationSerializer(serializers.ModelSerializer):
-
-    class Meta:
-        model = Notification
-
         fields = "__all__"
 
         read_only_fields = [
+            "id",
+            "uploaded_at",
+        ]
+
+
+# ============================================================
+# NOTIFICATION
+# ============================================================
+
+class NotificationSerializer(
+    serializers.ModelSerializer
+):
+
+    client_name = serializers.CharField(
+        source="client.full_name",
+        read_only=True,
+    )
+
+    client_phone = serializers.CharField(
+        source="client.phone",
+        read_only=True,
+    )
+
+    reservation_number = serializers.CharField(
+        source="reservation.reservation_number",
+        read_only=True,
+    )
+
+    notification_type_display = serializers.CharField(
+        source="get_notification_type_display",
+        read_only=True,
+    )
+
+    class Meta:
+
+        model = Notification
+
+        fields = [
+            "id",
+
             "user",
-            "created_at",
+
+            "client_name",
+            "client_phone",
+
+            "notification_type",
+            "notification_type_display",
+
+            "title",
+            "message",
+
+            "channel",
+            "delivery_status",
+
+            "is_read",
             "read_at",
+            "sent_at",
+
+            "reservation",
+            "reservation_number",
+
+            "payment",
+
+            "error_message",
+
+            "created_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "client_name",
+            "client_phone",
+            "reservation_number",
+            "notification_type_display",
+            "created_at",
         ]

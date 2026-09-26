@@ -1,112 +1,150 @@
-from django.urls import path, include
-
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
     ClientViewSet,
     HallViewSet,
-    ServiceViewSet,
     MaterialViewSet,
     ReservationViewSet,
-    ReservationServiceViewSet,
-    ReservationMaterialViewSet,
     FinancialAccountViewSet,
     PaymentViewSet,
     CashMovementViewSet,
     ExpenseViewSet,
     ContractViewSet,
     NotificationViewSet,
+    PersonnelViewSet,
     calendar_view,
+    dashboard_report,
+    dashboard_excel,
+    dashboard_pdf,
+    TarifViewSet,
 )
 
+
+# ============================================================
+# ROUTER API
+# ============================================================
 
 router = DefaultRouter()
 
 router.register(
-    "clients",
+    r"clients",
     ClientViewSet,
-    basename="client"
+    basename="client",
 )
 
 router.register(
-    "halls",
+    r"halls",
     HallViewSet,
-    basename="hall"
+    basename="hall",
 )
 
 router.register(
-    "services",
-    ServiceViewSet,
-    basename="service"
+    r"tarifs",
+    TarifViewSet,
+    basename="tarif",
 )
 
 router.register(
-    "materials",
+    r"materials",
     MaterialViewSet,
-    basename="material"
+    basename="material",
 )
 
 router.register(
-    "reservations",
+    r"reservations",
     ReservationViewSet,
-    basename="reservation"
+    basename="reservation",
 )
 
 router.register(
-    "reservation-services",
-    ReservationServiceViewSet,
-    basename="reservation-service"
-)
-
-router.register(
-    "reservation-materials",
-    ReservationMaterialViewSet,
-    basename="reservation-material"
-)
-
-router.register(
-    "accounts",
+    r"accounts",
     FinancialAccountViewSet,
-    basename="financial-account"
+    basename="financial-account",
 )
 
 router.register(
-    "payments",
+    r"payments",
     PaymentViewSet,
-    basename="payment"
+    basename="payment",
 )
 
 router.register(
-    "cash-movements",
+    r"cash-movements",
     CashMovementViewSet,
-    basename="cash-movement"
+    basename="cash-movement",
 )
 
 router.register(
-    "expenses",
+    r"expenses",
     ExpenseViewSet,
-    basename="expense"
+    basename="expense",
 )
 
 router.register(
-    "contracts",
+    r"contracts",
     ContractViewSet,
-    basename="contract"
+    basename="contract",
 )
 
 router.register(
-    "notifications",
+    r"notifications",
     NotificationViewSet,
-    basename="notification"
+    basename="notification",
 )
 
+router.register(
+    r"personnel",
+    PersonnelViewSet,
+    basename="personnel",
+)
+
+
+# ============================================================
+# URLS
+# ============================================================
 
 urlpatterns = [
-    path("", include(router.urls)),
+    # CRUD principaux
+    path(
+        "",
+        include(router.urls),
+    ),
+
+    # ========================================================
+    # CALENDRIER
+    # ========================================================
 
     path(
         "calendar/<int:year>/<int:month>/",
         calendar_view,
         name="calendar",
     ),
+
+    # ========================================================
+    # TABLEAU DE BORD
+    # ========================================================
+
+    path(
+        "dashboard/",
+        dashboard_report,
+        name="dashboard",
+    ),
+
+    # ========================================================
+    # EXPORTS DU TABLEAU DE BORD
+    # ========================================================
+
+    path(
+        "dashboard/export/excel/",
+        dashboard_excel,
+        name="dashboard-excel",
+    ),
+
+    path(
+        "dashboard/export/pdf/",
+        dashboard_pdf,
+        name="dashboard-pdf",
+    ),
 ]
+
