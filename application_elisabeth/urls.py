@@ -11,13 +11,13 @@ from .views import (
     CashMovementViewSet,
     ExpenseViewSet,
     ContractViewSet,
-    NotificationViewSet,
     PersonnelViewSet,
     calendar_view,
     dashboard_report,
     dashboard_excel,
     dashboard_pdf,
     TarifViewSet,
+    RefundViewSet,
 )
 
 
@@ -88,9 +88,9 @@ router.register(
 )
 
 router.register(
-    r"notifications",
-    NotificationViewSet,
-    basename="notification",
+    r"refunds",
+    RefundViewSet,
+    basename="refund",
 )
 
 router.register(

@@ -1,4 +1,6 @@
-﻿from django.db.models import Count
+﻿from decimal import Decimal
+
+from django.db.models import Count, Sum
 from rest_framework import serializers
 
 from django.db import transaction
@@ -13,7 +15,6 @@ from .models import (
     CashMovement,
     Expense,
     Contract,
-    Notification,
     Personnel,
     Refund,Hall, 
     HallImage, 
@@ -678,6 +679,7 @@ class FinancialAccountSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+
 # ============================================================
 # PAYMENT
 # ============================================================
@@ -695,7 +697,6 @@ class PaymentSerializer(serializers.ModelSerializer):
     )
 
     class Meta:
-
         model = Payment
 
         fields = [
@@ -713,6 +714,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "receipt_pdf",
             "created_by",
             "created_at",
+            "idempotency_key",
         ]
 
         read_only_fields = [
@@ -723,14 +725,71 @@ class PaymentSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
-    def create(
-        self,
-        validated_data,
-    ):
+        extra_kwargs = {
+            "idempotency_key": {
+                "required": False,
+                "allow_null": True,
+            },
+            "reference": {
+                "required": False,
+                "allow_blank": True,
+                "allow_null": True,
+            },
+        }
 
-        request = self.context.get(
-            "request"
+    def validate_reference(self, value):
+
+        if value is None:
+            return None
+
+        value = value.strip()
+
+        if not value:
+            return None
+
+        return value
+
+    def validate(self, attrs):
+
+        reservation = attrs.get("reservation")
+
+        amount = attrs.get("amount")
+
+        status_value = attrs.get(
+            "status",
+            Payment.Status.EN_ATTENTE,
         )
+
+        if amount is not None and amount <= Decimal("0.00"):
+            raise serializers.ValidationError({
+                "amount": (
+                    "Le montant doit être supérieur à zéro."
+                )
+            })
+
+        if (
+            reservation
+            and amount
+            and status_value != Payment.Status.ANNULE
+        ):
+
+            # On ne fait ici qu'une vérification informative.
+            # Le verrouillage réel sera fait dans le ViewSet.
+            remaining = reservation.remaining_amount
+
+            if amount > remaining:
+                raise serializers.ValidationError({
+                    "amount": (
+                        f"Le montant maximum autorisé est "
+                        f"{remaining} $."
+                    )
+                })
+
+        return attrs
+
+    def create(self, validated_data):
+
+        request = self.context.get("request")
 
         if (
             request
@@ -739,9 +798,8 @@ class PaymentSerializer(serializers.ModelSerializer):
         ):
             validated_data["created_by"] = request.user
 
-        return super().create(
-            validated_data
-        )
+        return super().create(validated_data)
+
 
 
 # ============================================================
@@ -821,74 +879,94 @@ class ContractSerializer(serializers.ModelSerializer):
         ]
 
 
-# ============================================================
-# NOTIFICATION
-# ============================================================
-
-class NotificationSerializer(
-    serializers.ModelSerializer
-):
-
-    client_name = serializers.CharField(
-        source="client.full_name",
-        read_only=True,
-    )
-
-    client_phone = serializers.CharField(
-        source="client.phone",
-        read_only=True,
-    )
+class RefundSerializer(serializers.ModelSerializer):
 
     reservation_number = serializers.CharField(
         source="reservation.reservation_number",
         read_only=True,
     )
 
-    notification_type_display = serializers.CharField(
-        source="get_notification_type_display",
+    client_name = serializers.CharField(
+        source="reservation.client.full_name",
+        read_only=True,
+    )
+
+    payment_amount = serializers.DecimalField(
+        source="payment.amount",
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    already_refunded = serializers.SerializerMethodField()
+
+    refundable_amount = serializers.SerializerMethodField()
+
+    account_name = serializers.CharField(
+        source="financial_account.name",
+        read_only=True,
+    )
+
+    method_display = serializers.CharField(
+        source="get_method_display",
+        read_only=True,
+    )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
         read_only=True,
     )
 
     class Meta:
-
-        model = Notification
+        model = Refund
 
         fields = [
             "id",
-
-            "user",
-
-            "client_name",
-            "client_phone",
-
-            "notification_type",
-            "notification_type_display",
-
-            "title",
-            "message",
-
-            "channel",
-            "delivery_status",
-
-            "is_read",
-            "read_at",
-            "sent_at",
-
+            "payment",
             "reservation",
             "reservation_number",
-
-            "payment",
-
-            "error_message",
-
+            "client_name",
+            "financial_account",
+            "account_name",
+            "payment_amount",
+            "already_refunded",
+            "refundable_amount",
+            "amount",
+            "refund_date",
+            "method",
+            "method_display",
+            "reason",
+            "reference",
+            "status",
+            "status_display",
+            "created_by",
             "created_at",
         ]
 
         read_only_fields = [
-            "id",
-            "client_name",
-            "client_phone",
-            "reservation_number",
-            "notification_type_display",
+            "created_by",
             "created_at",
         ]
+
+    def get_already_refunded(self, obj):
+        total = (
+            Refund.objects
+            .filter(
+                payment=obj.payment,
+                status=Refund.Status.VALIDE,
+            )
+            .exclude(pk=obj.pk)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        return total
+
+    def get_refundable_amount(self, obj):
+        return max(
+            obj.payment.amount
+            - self.get_already_refunded(obj),
+            Decimal("0.00"),
+        )
+

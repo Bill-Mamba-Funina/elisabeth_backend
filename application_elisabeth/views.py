@@ -7,6 +7,8 @@ from django.http import JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
+from .services.notification_service import send_notification
+
 from rest_framework import status, viewsets
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
@@ -47,7 +49,6 @@ from .models import (
     CashMovement,
     Expense,
     Contract,
-    Notification,
     Personnel,
     Refund,
     Tarif,
@@ -63,12 +64,12 @@ from .serializers import (
     CashMovementSerializer,
     ExpenseSerializer,
     ContractSerializer,
-    NotificationSerializer,
     PersonnelSerializer,
     HallSerializer,
     HallImageSerializer,
     HallVideoSerializer,
     TarifSerializer,
+    RefundSerializer,
 )
 
 from .services.pdf_service import generate_payment_receipt_pdf
@@ -89,10 +90,23 @@ from .services.pdf_service import generate_payment_receipt_pdf
 # ============================================================
 
 class ClientViewSet(viewsets.ModelViewSet):
+
     queryset = Client.objects.all().order_by("full_name")
     serializer_class = ClientSerializer
     permission_classes = [IsAuthenticated]
 
+    def perform_create(self, serializer):
+
+        client = serializer.save()
+
+        send_notification(
+            subject="Nouveau client",
+            message=(
+                f"Un nouveau client a été créé.\n\n"
+                f"Nom : {client.full_name}\n"
+                f"Téléphone : {client.phone}"
+            ),
+        )
 
 # ============================================================
 # SALLES
@@ -305,189 +319,72 @@ class MaterialViewSet(viewsets.ModelViewSet):
 # RESERVATIONS
 # ============================================================
 
-class ReservationViewSet(viewsets.ModelViewSet):
+class ReservationViewSet(viewsets.ModelViewSet): 
+    queryset = ( 
+        Reservation.objects 
+        .select_related("client", "hall", "tarif") 
+        .prefetch_related("payments", "refunds") 
+        .order_by("-event_date") 
+    ) 
+    serializer_class = ReservationSerializer 
+    permission_classes = [IsAuthenticated] 
 
-    queryset = (
-        Reservation.objects
-        .select_related(
-            "client",
-            "hall",
-            "tarif",
-        )
-        .prefetch_related(
-            "payments",
-            "refunds",
-        )
-        .order_by("-event_date")
-    )
+    def perform_create(self, serializer): 
+        reservation = serializer.save(created_by=self.request.user) 
 
-    serializer_class = ReservationSerializer
+        client_name = reservation.client.full_name if reservation.client else "Non renseigné" 
+        send_notification( 
+            subject="Nouvelle réservation", 
+            message=( 
+                f"La réservation {reservation.reservation_number} a été créée.\n\n" 
+                f"Client : {client_name}\n" 
+                f"Date : {reservation.event_date}\n" 
+                f"Événement : {reservation.event_type or 'Non renseigné'}" 
+            ), 
+        ) 
 
-    permission_classes = [IsAuthenticated]
+    def perform_update(self, serializer): 
+        old_status = serializer.instance.status 
+        reservation = serializer.save() 
 
-    # --------------------------------------------------------
-    # CREATION
-    # --------------------------------------------------------
+        if old_status != Reservation.Status.CONFIRMEE and reservation.status == Reservation.Status.CONFIRMEE: 
+            send_notification( 
+                subject="Réservation confirmée", 
+                message=f"La réservation {reservation.reservation_number} est maintenant confirmée.", 
+            ) 
 
-    def perform_create(self, serializer):
+    @action(detail=True, methods=["post"], url_path="confirmer") 
+    def confirmer(self, request, pk=None): 
+        reservation = self.get_object() 
 
-        reservation = serializer.save(
-            created_by=self.request.user
-        )
+        if reservation.status == Reservation.Status.ANNULEE: 
+            return Response( 
+                {"detail": "Une réservation annulée ne peut pas être confirmée."}, 
+                status=status.HTTP_400_BAD_REQUEST, 
+            ) 
 
-        Notification.objects.create(
-            user=self.request.user,
+        reservation.status = Reservation.Status.CONFIRMEE 
+        reservation.save() 
 
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CREATED
-            ),
+        send_notification( 
+            subject="Réservation confirmée", 
+            message=f"La réservation {reservation.reservation_number} est maintenant confirmée.", 
+        ) 
 
-            title="Nouvelle réservation",
+        return Response(ReservationSerializer(reservation, context={"request": request}).data) 
 
-            message=(
-                f"La réservation "
-                f"{reservation.reservation_number} "
-                f"a été créée."
-            ),
+    @action(detail=True, methods=["post"], url_path="annuler") 
+    def annuler(self, request, pk=None): 
+        reservation = self.get_object() 
+        reservation.status = Reservation.Status.ANNULEE 
+        reservation.save() 
 
-            reservation=reservation,
-        )
+        send_notification( 
+            subject="Réservation annulée", 
+            message=f"La réservation {reservation.reservation_number} a été annulée.", 
+        ) 
 
-    # --------------------------------------------------------
-    # MODIFICATION
-    # --------------------------------------------------------
-
-    def perform_update(self, serializer):
-
-        old_status = serializer.instance.status
-
-        reservation = serializer.save()
-
-        if (
-            old_status != Reservation.Status.CONFIRMEE
-            and reservation.status
-            == Reservation.Status.CONFIRMEE
-        ):
-
-            Notification.objects.create(
-                user=self.request.user,
-
-                notification_type=(
-                    Notification.NotificationType.RESERVATION_CONFIRMED
-                ),
-
-                title="Réservation confirmée",
-
-                message=(
-                    f"La réservation "
-                    f"{reservation.reservation_number} "
-                    f"a été confirmée."
-                ),
-
-                reservation=reservation,
-            )
-
-    # --------------------------------------------------------
-    # CONFIRMER
-    # --------------------------------------------------------
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="confirmer",
-    )
-    def confirmer(self, request, pk=None):
-
-        reservation = self.get_object()
-
-        if (
-            reservation.status
-            == Reservation.Status.ANNULEE
-        ):
-            return Response(
-                {
-                    "detail": (
-                        "Une réservation annulée "
-                        "ne peut pas être confirmée."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        reservation.status = Reservation.Status.CONFIRMEE
-
-        reservation.save()
-
-        Notification.objects.create(
-            user=request.user,
-
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CONFIRMED
-            ),
-
-            title="Réservation confirmée",
-
-            message=(
-                f"La réservation "
-                f"{reservation.reservation_number} "
-                f"est maintenant confirmée."
-            ),
-
-            reservation=reservation,
-        )
-
-        return Response(
-            ReservationSerializer(
-                reservation,
-                context={
-                    "request": request,
-                },
-            ).data
-        )
-
-    # --------------------------------------------------------
-    # ANNULER
-    # --------------------------------------------------------
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="annuler",
-    )
-    def annuler(self, request, pk=None):
-
-        reservation = self.get_object()
-
-        reservation.status = Reservation.Status.ANNULEE
-
-        reservation.save()
-
-        Notification.objects.create(
-            user=request.user,
-
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CANCELLED
-            ),
-
-            title="Réservation annulée",
-
-            message=(
-                f"La réservation "
-                f"{reservation.reservation_number} "
-                f"a été annulée."
-            ),
-
-            reservation=reservation,
-        )
-
-        return Response(
-            ReservationSerializer(
-                reservation,
-                context={
-                    "request": request,
-                },
-            ).data
-        )
+        return Response(ReservationSerializer(reservation, context={"request": request}).data)
 
 
 # ============================================================
@@ -524,11 +421,14 @@ class TarifViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
+
+
 # ============================================================
 # PAIEMENTS
 # ============================================================
 
 class PaymentViewSet(viewsets.ModelViewSet):
+
     queryset = (
         Payment.objects
         .select_related(
@@ -542,114 +442,82 @@ class PaymentViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = PaymentSerializer
+
     permission_classes = [IsAuthenticated]
 
-    def perform_create(self, serializer):
-        """
-        Création d'un paiement.
+    # ========================================================
+    # CREATION
+    # ========================================================
 
-        Le paiement est créé avec l'utilisateur connecté.
-        Le compte financier reste facultatif.
-        """
-
-        payment = serializer.save(
-            created_by=self.request.user
-        )
-
-        # Notification uniquement après création
-        if payment.reservation:
-            # ✅ CORRECT
-    Notification.objects.create(
-        user=request.user, # ou payment.user / reservation.client.user selon votre logique
-        title="Paiement reçu",
-        message="Le paiement a été enregistré avec succès.",
-        notification_type="PAIEMENT",  # Nom du champ dans models.py
-    )
-                title="Nouveau paiement",
-                message=(
-                    f"Un paiement de {payment.amount} $ "
-                    f"a été enregistré pour la réservation "
-                    f"{payment.reservation.reservation_number}."
-                ),
-                reservation=payment.reservation,
-                payment=payment,
-            )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="valider",
-    )
     @transaction.atomic
-    def valider(self, request, pk=None):
-        """
-        Valide un paiement.
+    def perform_create(self, serializer):
 
-        La validation :
-        - change le statut du paiement à VALIDE ;
-        - génère le mouvement financier ENTRÉE si nécessaire ;
-        - met à jour le statut de paiement de la réservation ;
-        - génère le reçu PDF.
-        """
+        validated_data = serializer.validated_data
 
-        payment = self.get_object()
+        reservation = validated_data.get("reservation")
 
-        if payment.status == Payment.Status.VALIDE:
-            return Response(
-                {
-                    "detail": "Ce paiement est déjà validé."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if payment.status == Payment.Status.ANNULE:
-            return Response(
-                {
-                    "detail": (
-                        "Un paiement annulé ne peut pas être validé."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        payment.status = Payment.Status.VALIDE
-        payment.save(
-            update_fields=["status"]
+        idempotency_key = validated_data.get(
+            "idempotency_key"
         )
 
         # ----------------------------------------------------
-        # MOUVEMENT FINANCIER
+        # PROTECTION CONTRE LE DOUBLE POST
         # ----------------------------------------------------
 
-        if payment.financial_account:
+        if idempotency_key:
 
-            CashMovement.objects.create(
-                account=payment.financial_account,
-                payment=payment,
-                reservation=payment.reservation,
-                movement_type=(
-                    CashMovement.MovementType.ENTREE
-                ),
-                amount=payment.amount,
-                description=(
-                    f"Paiement validé "
-                    f"{payment.id}"
-                ),
-                created_by=request.user,
+            existing_payment = (
+                Payment.objects
+                .select_for_update()
+                .filter(
+                    idempotency_key=idempotency_key
+                )
+                .first()
             )
 
+            if existing_payment:
+
+                raise serializers.ValidationError({
+                    "detail": (
+                        "Ce paiement a déjà été enregistré."
+                    ),
+                    "payment_id": existing_payment.id,
+                })
+
         # ----------------------------------------------------
-        # MISE À JOUR RÉSERVATION
+        # VERROUILLAGE DE LA RESERVATION
         # ----------------------------------------------------
+        #
+        # Très important :
+        #
+        # Deux requêtes simultanées ne peuvent pas calculer
+        # le même reste à payer et créer deux paiements.
+        #
 
-        if payment.reservation:
+        locked_reservation = None
 
-            reservation = payment.reservation
+        if reservation:
 
-            total_paye = (
+            locked_reservation = (
+                Reservation.objects
+                .select_for_update()
+                .select_related("tarif")
+                .get(pk=reservation.pk)
+            )
+
+            # ------------------------------------------------
+            # RESTE A PAYER ACTUEL
+            # ------------------------------------------------
+
+            total = (
+                locked_reservation.total_amount
+                or Decimal("0.00")
+            )
+
+            already_paid = (
                 Payment.objects
                 .filter(
-                    reservation=reservation,
+                    reservation=locked_reservation,
                     status=Payment.Status.VALIDE,
                 )
                 .aggregate(
@@ -659,64 +527,354 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 or Decimal("0.00")
             )
 
-            montant_reservation = Decimal("0.00")
+            refunded = (
+                locked_reservation.refunded_amount
+            )
 
-            if reservation.tarif:
-                montant_reservation = (
-                    reservation.tarif.amount
-                    or Decimal("0.00")
-                )
+            remaining = (
+                total
+                - already_paid
+                + refunded
+            )
 
-            if total_paye >= montant_reservation:
-                reservation.payment_status = (
-                    Reservation.PaymentStatus.PAYE
-                )
+            if remaining < Decimal("0.00"):
+                remaining = Decimal("0.00")
 
-            elif total_paye > Decimal("0.00"):
-                reservation.payment_status = (
-                    Reservation.PaymentStatus.PARTIEL
-                )
+            amount = validated_data.get("amount")
 
-            else:
-                reservation.payment_status = (
-                    Reservation.PaymentStatus.NON_PAYE
-                )
-
-            reservation.save(
-                update_fields=["payment_status"]
+            status_value = validated_data.get(
+                "status",
+                Payment.Status.EN_ATTENTE,
             )
 
             # ------------------------------------------------
-            # NOTIFICATION
+            # PAIEMENT ANNULE
             # ------------------------------------------------
 
-            Notification.objects.create(
-                user=request.user,
-                notification_type=(
-                    Notification.NotificationType.PAYMENT_VALIDATED
-                ),
-                title="Paiement validé",
-                message=(
-                    f"Le paiement de "
-                    f"{payment.amount} $ "
-                    f"pour la réservation "
-                    f"{reservation.reservation_number} "
-                    f"a été validé."
-                ),
-                reservation=reservation,
-                payment=payment,
+            if status_value == Payment.Status.ANNULE:
+
+                raise serializers.ValidationError({
+                    "status": (
+                        "Un paiement ne peut pas être "
+                        "créé directement avec le statut "
+                        "ANNULÉ."
+                    )
+                })
+
+            # ------------------------------------------------
+            # RESERVATION DEJA PAYEE
+            # ------------------------------------------------
+
+            if remaining <= Decimal("0.00"):
+
+                raise serializers.ValidationError({
+                    "amount": (
+                        "Cette réservation est déjà "
+                        "entièrement payée."
+                    )
+                })
+
+            # ------------------------------------------------
+            # DEPASSEMENT
+            # ------------------------------------------------
+
+            if amount > remaining:
+
+                raise serializers.ValidationError({
+                    "amount": (
+                        f"Le montant maximum autorisé est "
+                        f"{remaining} $."
+                    )
+                })
+
+            # On remplace l'objet reservation du serializer
+            # par l'objet verrouillé.
+            validated_data["reservation"] = (
+                locked_reservation
             )
 
         # ----------------------------------------------------
-        # REÇU PDF
+        # REFERENCE UNIQUE SI FOURNIE
         # ----------------------------------------------------
+
+        reference = validated_data.get("reference")
+
+        if reference:
+
+            existing_reference = (
+                Payment.objects
+                .select_for_update()
+                .filter(reference=reference)
+                .first()
+            )
+
+            if existing_reference:
+
+                raise serializers.ValidationError({
+                    "reference": (
+                        "Cette référence de paiement "
+                        "est déjà utilisée."
+                    ),
+                    "payment_id": existing_reference.id,
+                })
+
+        # ----------------------------------------------------
+        # CREATION UNIQUE
+        # ----------------------------------------------------
+
+        serializer.save(
+            created_by=self.request.user
+        )
+
+    # ========================================================
+    # VALIDER
+    # ========================================================
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="valider",
+    )
+    @transaction.atomic
+    def valider(self, request, pk=None):
+
+        # ----------------------------------------------------
+        # VERROUILLER LE PAIEMENT
+        # ----------------------------------------------------
+
+        payment = (
+            Payment.objects
+            .select_for_update()
+            .select_related(
+                "reservation",
+                "reservation__client",
+                "financial_account",
+            )
+            .get(pk=pk)
+        )
+
+        # ----------------------------------------------------
+        # DEJA VALIDE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.VALIDE:
+
+            return Response(
+                {
+                    "detail": (
+                        "Ce paiement est déjà validé."
+                    ),
+                    "payment": PaymentSerializer(
+                        payment,
+                        context={
+                            "request": request,
+                        },
+                    ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # ----------------------------------------------------
+        # ANNULE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.ANNULE:
+
+            return Response(
+                {
+                    "detail": (
+                        "Un paiement annulé ne peut pas "
+                        "être validé."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ----------------------------------------------------
+        # VERROUILLER LA RESERVATION
+        # ----------------------------------------------------
+
+        reservation = None
+
+        if payment.reservation_id:
+
+            reservation = (
+                Reservation.objects
+                .select_for_update()
+                .select_related("tarif")
+                .get(
+                    pk=payment.reservation_id
+                )
+            )
+
+            # ------------------------------------------------
+            # CALCUL DU RESTE
+            # ------------------------------------------------
+
+            total = (
+                reservation.total_amount
+                or Decimal("0.00")
+            )
+
+            other_paid = (
+                Payment.objects
+                .filter(
+                    reservation=reservation,
+                    status=Payment.Status.VALIDE,
+                )
+                .exclude(pk=payment.pk)
+                .aggregate(
+                    total=Sum("amount")
+                )
+                .get("total")
+                or Decimal("0.00")
+            )
+
+            refunded = (
+                reservation.refunded_amount
+            )
+
+            remaining = (
+                total
+                - other_paid
+                + refunded
+            )
+
+            if remaining < Decimal("0.00"):
+                remaining = Decimal("0.00")
+
+            # ------------------------------------------------
+            # PAIEMENT DEJA COUVERT
+            # ------------------------------------------------
+
+            if remaining <= Decimal("0.00"):
+
+                return Response(
+                    {
+                        "detail": (
+                            "Cette réservation est déjà "
+                            "entièrement payée."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # ------------------------------------------------
+            # DEPASSEMENT
+            # ------------------------------------------------
+
+            if payment.amount > remaining:
+
+                return Response(
+                    {
+                        "detail": (
+                            f"Le montant du paiement "
+                            f"({payment.amount} $) dépasse "
+                            f"le reste à payer "
+                            f"({remaining} $)."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # ====================================================
+        # VALIDATION DU PAIEMENT
+        # ====================================================
+
+        payment.status = Payment.Status.VALIDE
+
+        payment.save(
+            update_fields=["status"]
+        )
+
+        # ====================================================
+        # MOUVEMENT FINANCIER UNIQUE
+        # ====================================================
+
+        if payment.financial_account:
+
+            # -----------------------------------------------
+            # VERROUILLAGE DU COMPTE
+            # -----------------------------------------------
+
+            account = (
+                FinancialAccount.objects
+                .select_for_update()
+                .get(
+                    pk=payment.financial_account_id
+                )
+            )
+
+            # -----------------------------------------------
+            # VERIFICATION EXISTENCE MOUVEMENT
+            # -----------------------------------------------
+
+            mouvement_existe = (
+                CashMovement.objects
+                .filter(
+                    payment=payment,
+                    movement_type=(
+                        CashMovement.MovementType.ENTREE
+                    ),
+                )
+                .exists()
+            )
+
+            # -----------------------------------------------
+            # CREATION UNIQUE
+            # -----------------------------------------------
+
+            if not mouvement_existe:
+
+                account.balance += payment.amount
+
+                account.save(
+                    update_fields=["balance"]
+                )
+
+                CashMovement.objects.create(
+                    account=account,
+                    payment=payment,
+                    reservation=payment.reservation,
+                    movement_type=(
+                        CashMovement.MovementType.ENTREE
+                    ),
+                    amount=payment.amount,
+                    description=(
+                        f"Paiement validé "
+                        f"#{payment.id}"
+                    ),
+                    created_by=request.user,
+                )
+
+        # ====================================================
+        # MISE A JOUR RESERVATION
+        # ====================================================
+
+        if reservation:
+
+            reservation.recalculate_financials()
+
+        # ====================================================
+        # RECU PDF
+        # ====================================================
 
         try:
-            generate_payment_receipt_pdf(payment)
-        except Exception:
-            # Le paiement reste valide même si la génération
-            # du reçu rencontre un problème.
-            pass
+
+            generate_payment_receipt_pdf(
+                payment
+            )
+
+        except Exception as exc:
+
+            print(
+                "Erreur génération reçu PDF :",
+                exc,
+            )
+
+        # ====================================================
+        # REPONSE
+        # ====================================================
 
         return Response(
             PaymentSerializer(
@@ -728,6 +886,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    # ========================================================
+    # ANNULER
+    # ========================================================
+
     @action(
         detail=True,
         methods=["post"],
@@ -735,20 +897,33 @@ class PaymentViewSet(viewsets.ModelViewSet):
     )
     @transaction.atomic
     def annuler(self, request, pk=None):
-        """
-        Annule un paiement qui n'a pas encore été validé.
-        """
 
-        payment = self.get_object()
+        payment = (
+            Payment.objects
+            .select_for_update()
+            .get(pk=pk)
+        )
 
         if payment.status == Payment.Status.VALIDE:
+
             return Response(
                 {
                     "detail": (
-                        "Un paiement déjà validé ne peut pas "
-                        "être annulé directement. "
-                        "Utilisez une procédure de remboursement "
-                        "ou de correction."
+                        "Un paiement déjà validé ne peut "
+                        "pas être annulé directement. "
+                        "Utilisez une procédure de "
+                        "remboursement ou de correction."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if payment.status == Payment.Status.ANNULE:
+
+            return Response(
+                {
+                    "detail": (
+                        "Ce paiement est déjà annulé."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -760,24 +935,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
             update_fields=["status"]
         )
 
-        if payment.reservation:
-
-            Notification.objects.create(
-                user=request.user,
-                notification_type=(
-                    Notification.NotificationType.PAYMENT_CANCELLED
-                ),
-                title="Paiement annulé",
-                message=(
-                    f"Le paiement de {payment.amount} $ "
-                    f"pour la réservation "
-                    f"{payment.reservation.reservation_number} "
-                    f"a été annulé."
-                ),
-                reservation=payment.reservation,
-                payment=payment,
-            )
-
         return Response(
             PaymentSerializer(
                 payment,
@@ -787,19 +944,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
             ).data
         )
 
+    # ========================================================
+    # RECU PDF
+    # ========================================================
+
     @action(
         detail=True,
         methods=["get"],
         url_path="recu",
     )
     def recu(self, request, pk=None):
-        """
-        Génère/télécharge le reçu PDF du paiement.
-        """
 
         payment = self.get_object()
 
         if payment.status != Payment.Status.VALIDE:
+
             return Response(
                 {
                     "detail": (
@@ -810,9 +969,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        pdf = generate_payment_receipt_pdf(payment)
+        pdf = generate_payment_receipt_pdf(
+            payment
+        )
 
         return pdf
+
 
 # ============================================================
 # RESERVATIONS
@@ -1097,64 +1259,6 @@ class ContractViewSet(viewsets.ModelViewSet):
         )
 
 
-# ============================================================
-# NOTIFICATIONS
-# ============================================================
-
-
-# ============================================================
-# NOTIFICATIONS
-# ============================================================
-
-class NotificationViewSet(viewsets.ModelViewSet):
-
-    queryset = (
-        Notification.objects
-        .select_related(
-            "user",
-            "reservation",
-            "reservation__client",
-            "payment",
-        )
-        .all()
-        .order_by(
-            "-created_at",
-            "-id",
-        )
-    )
-
-    serializer_class = NotificationSerializer
-
-    permission_classes = [IsAuthenticated]
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="lire",
-    )
-    def lire(self, request, pk=None):
-
-        notification = self.get_object()
-
-        notification.is_read = True
-        notification.read_at = timezone.now()
-
-        notification.save(
-            update_fields=[
-                "is_read",
-                "read_at",
-            ]
-        )
-
-        return Response(
-            NotificationSerializer(
-                notification,
-                context={
-                    "request": request,
-                },
-            ).data
-        )
-
 
 # ============================================================
 # CALENDRIER
@@ -1237,11 +1341,29 @@ def calendar_view(request, year, month):
 
 
 class PersonnelViewSet(viewsets.ModelViewSet):
-    queryset = Personnel.objects.all().order_by("nom", "prenom")
+
+    queryset = Personnel.objects.all().order_by(
+        "nom",
+        "prenom",
+    )
+
     serializer_class = PersonnelSerializer
-    permission_classes = []
+    permission_classes = [IsAuthenticated]
 
+    def perform_create(self, serializer):
 
+        personnel = serializer.save()
+
+        send_notification(
+            subject="Nouveau personnel",
+            message=(
+                f"Un nouveau membre du personnel "
+                f"a été ajouté.\n\n"
+                f"Nom : "
+                f"{personnel.nom} "
+                f"{personnel.prenom}"
+            ),
+        )
 
 
 
@@ -2447,5 +2569,106 @@ def dashboard_pdf(request):
     document.build(elements)
 
     return response
+
+
+
+class RefundViewSet(viewsets.ModelViewSet):
+
+    queryset = (
+        Refund.objects
+        .select_related(
+            "payment",
+            "reservation",
+            "reservation__client",
+            "financial_account",
+            "created_by",
+        )
+        .all()
+    )
+
+    serializer_class = RefundSerializer
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def perform_create(self, serializer):
+
+        with transaction.atomic():
+
+            payment_id = serializer.validated_data["payment"].id
+
+            payment = (
+                Payment.objects
+                .select_for_update()
+                .select_related(
+                    "reservation",
+                    "financial_account",
+                )
+                .get(pk=payment_id)
+            )
+
+            if payment.status != Payment.Status.VALIDE:
+                raise ValidationError(
+                    "Seul un paiement validé peut être remboursé."
+                )
+
+            if not payment.reservation:
+                raise ValidationError(
+                    "Ce paiement n'est lié à aucune réservation."
+                )
+
+            refund_amount = serializer.validated_data["amount"]
+
+            already_refunded = (
+                Refund.objects
+                .filter(
+                    payment=payment,
+                    status=Refund.Status.VALIDE,
+                )
+                .aggregate(total=Sum("amount"))
+                .get("total")
+                or Decimal("0.00")
+            )
+
+            refundable_amount = (
+                payment.amount - already_refunded
+            )
+
+            if refund_amount > refundable_amount:
+                raise ValidationError(
+                    (
+                        f"Montant impossible. "
+                        f"Montant maximum remboursable : "
+                        f"{refundable_amount} $."
+                    )
+                )
+
+            if not payment.financial_account:
+                raise ValidationError(
+                    "Ce paiement n'est associé à aucun compte financier."
+                )
+
+            account = (
+                FinancialAccount.objects
+                .select_for_update()
+                .get(pk=payment.financial_account_id)
+            )
+
+            if account.balance < refund_amount:
+                raise ValidationError(
+                    (
+                        f"Solde insuffisant sur "
+                        f"{account.name}. "
+                        f"Solde disponible : "
+                        f"{account.balance} $."
+                    )
+                )
+
+            serializer.save(
+                reservation=payment.reservation,
+                financial_account=account,
+                created_by=self.request.user,
+            )
 
 

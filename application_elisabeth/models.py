@@ -545,10 +545,13 @@ class FinancialAccount(models.Model):
         return f"{self.name} - {self.balance} $"
 
 
+
 # ============================================================
 # PAIEMENT
 # ============================================================
+
 class Payment(models.Model):
+
     class Method(models.TextChoices):
         ESPECES = "ESPECES", "Espèces"
         VIREMENT = "VIREMENT", "Virement bancaire"
@@ -566,6 +569,7 @@ class Payment(models.Model):
         blank=True,
         null=True,
     )
+
     financial_account = models.ForeignKey(
         FinancialAccount,
         on_delete=models.SET_NULL,
@@ -573,38 +577,46 @@ class Payment(models.Model):
         blank=True,
         null=True,
     )
+
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
     )
+
     payment_date = models.DateTimeField(
         default=timezone.now,
     )
+
     method = models.CharField(
         max_length=30,
         choices=Method.choices,
         default=Method.ESPECES,
     )
+
     reference = models.CharField(
         max_length=100,
         blank=True,
         null=True,
     )
+
     operator = models.CharField(
         max_length=150,
         blank=True,
         null=True,
     )
+
     status = models.CharField(
         max_length=30,
         choices=Status.choices,
-        default=Status.VALIDE,
+        default=Status.EN_ATTENTE,
     )
+
     receipt_pdf = models.FileField(
         upload_to="payments/receipts/",
         blank=True,
         null=True,
     )
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -612,193 +624,163 @@ class Payment(models.Model):
         blank=True,
         null=True,
     )
+
     created_at = models.DateTimeField(
         auto_now_add=True,
     )
 
+    # ========================================================
+    # CLÉ D'IDEMPOTENCE
+    # ========================================================
+    #
+    # Cette clé identifie UNE opération de paiement.
+    #
+    # Si le frontend envoie deux fois exactement la même
+    # opération, Django retrouvera le premier paiement
+    # au lieu d'en créer un deuxième.
+    #
+    idempotency_key = models.UUIDField(
+        unique=True,
+        db_index=True,
+        null=True,
+        blank=True,
+    )
+
     class Meta:
         ordering = ["-created_at"]
+
         verbose_name = "Paiement"
         verbose_name_plural = "Paiements"
 
     def clean(self):
         super().clean()
 
-        if self.amount is not None:
-            if self.amount <= Decimal("0.00"):
+        # ----------------------------------------------------
+        # MONTANT
+        # ----------------------------------------------------
+
+        if self.amount is None:
+            raise ValidationError(
+                "Le montant du paiement est obligatoire."
+            )
+
+        if self.amount <= Decimal("0.00"):
+            raise ValidationError(
+                "Le montant du paiement doit être supérieur à zéro."
+            )
+
+        # ----------------------------------------------------
+        # VALIDATION DU COMPTE FINANCIER
+        # ----------------------------------------------------
+
+        if self.financial_account:
+
+            if (
+                self.financial_account.account_type
+                == FinancialAccount.AccountType.CAISSE
+                and self.method != self.Method.ESPECES
+            ):
                 raise ValidationError(
-                    "Le montant du paiement doit être supérieur à zéro."
+                    "La caisse physique ne peut recevoir "
+                    "que les paiements en espèces."
                 )
 
-        # Anti-double paiement / sur-paiement
-        if self.reservation and self.amount:
+            if (
+                self.financial_account.account_type
+                == FinancialAccount.AccountType.BANQUE
+                and self.method != self.Method.VIREMENT
+            ):
+                raise ValidationError(
+                    "Le compte bancaire doit être associé "
+                    "à un virement bancaire."
+                )
+
+            if (
+                self.financial_account.account_type
+                == FinancialAccount.AccountType.MOBILE_MONEY
+                and self.method != self.Method.MOBILE_MONEY
+            ):
+                raise ValidationError(
+                    "Le compte Mobile Money doit être associé "
+                    "à un paiement Mobile Money."
+                )
+
+        # ----------------------------------------------------
+        # VÉRIFICATION DU RESTE À PAYER
+        # ----------------------------------------------------
+        #
+        # IMPORTANT :
+        # cette vérification ne modifie aucun compte.
+        #
+        # Le verrouillage réel de la réservation est fait
+        # dans PaymentViewSet.perform_create().
+        #
+
+        if self.reservation_id and self.status != self.Status.ANNULE:
+
             remaining = self.reservation.remaining_amount
-            # Si c'est une modification, on rajoute temporairement l'ancien montant
+
+            # Modification d'un paiement existant
             if self.pk:
-                old_payment = Payment.objects.filter(pk=self.pk).first()
-                if old_payment and old_payment.status == self.Status.VALIDE:
+
+                old_payment = (
+                    Payment.objects
+                    .filter(pk=self.pk)
+                    .first()
+                )
+
+                if (
+                    old_payment
+                    and old_payment.status == self.Status.VALIDE
+                ):
                     remaining += old_payment.amount
 
             if remaining <= Decimal("0.00"):
                 raise ValidationError(
-                    "Cette réservation est déjà entièrement payée. Aucun paiement supplémentaire n'est autorisé."
+                    "Cette réservation est déjà entièrement payée."
                 )
 
             if self.amount > remaining:
                 raise ValidationError(
-                    f"Le montant du paiement ({self.amount} $) dépasse le solde restant à payer ({remaining} $)."
+                    (
+                        f"Le montant du paiement ({self.amount} $) "
+                        f"dépasse le solde restant à payer "
+                        f"({remaining} $)."
+                    )
                 )
 
-        if self.financial_account:
-            if (
-                self.financial_account.account_type == FinancialAccount.AccountType.CAISSE
-                and self.method != self.Method.ESPECES
-            ):
-                raise ValidationError(
-                    "La caisse physique ne peut recevoir que les paiements en espèces."
-                )
-            if (
-                self.financial_account.account_type == FinancialAccount.AccountType.BANQUE
-                and self.method != self.Method.VIREMENT
-            ):
-                raise ValidationError(
-                    "Le compte bancaire doit être associé à un virement bancaire."
-                )
-            if (
-                self.financial_account.account_type == FinancialAccount.AccountType.MOBILE_MONEY
-                and self.method != self.Method.MOBILE_MONEY
-            ):
-                raise ValidationError(
-                    "Le compte Mobile Money doit être associé à un paiement Mobile Money."
-                )
+    # ========================================================
+    # SAVE
+    # ========================================================
+    #
+    # IMPORTANT :
+    #
+    # NE PAS créer CashMovement ici.
+    #
+    # Le mouvement financier est créé UNIQUEMENT dans
+    # PaymentViewSet.valider().
+    #
+    # Cela supprime le double enregistrement.
+    #
 
-    @transaction.atomic
     def save(self, *args, **kwargs):
-        is_new = self.pk is None
+
         self.full_clean()
+
         super().save(*args, **kwargs)
-
-        if is_new and self.status == self.Status.VALIDE and self.financial_account:
-            self.financial_account.balance += self.amount
-            self.financial_account.save(update_fields=["balance"])
-
-            CashMovement.objects.create(
-                account=self.financial_account,
-                movement_type=CashMovement.MovementType.ENTREE,
-                amount=self.amount,
-                description=(
-                    f"Paiement reçu pour réservation {self.reservation.reservation_number}"
-                    if self.reservation
-                    else "Paiement reçu"
-                ),
-                payment=self,
-                reservation=self.reservation,
-                created_by=self.created_by,
-            )
 
         if self.reservation_id:
             self.reservation.recalculate_financials()
 
     def __str__(self):
+
         if self.reservation:
-            return f"Paiement #{self.id} - {self.reservation.reservation_number}"
+            return (
+                f"Paiement #{self.id} - "
+                f"{self.reservation.reservation_number}"
+            )
+
         return f"Paiement #{self.id}"
-
-
-# ============================================================
-# REMBOURSEMENT
-# ============================================================
-class Refund(models.Model):
-    reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.CASCADE,
-        related_name="refunds",
-    )
-    financial_account = models.ForeignKey(
-        FinancialAccount,
-        on_delete=models.PROTECT,
-        related_name="refunds",
-    )
-    amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-    )
-    reason = models.TextField(
-        blank=True,
-        null=True,
-    )
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="created_refunds",
-    )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-
-    class Meta:
-        ordering = ["-created_at"]
-        verbose_name = "Remboursement"
-        verbose_name_plural = "Remboursements"
-
-    def clean(self):
-        super().clean()
-        if self.amount is None or self.amount <= Decimal("0.00"):
-            raise ValidationError(
-                "Le montant du remboursement doit être supérieur à zéro."
-            )
-
-        already_refunded = (
-            self.reservation.refunds.exclude(pk=self.pk)
-            .aggregate(total=Sum("amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        max_refundable = self.reservation.paid_amount - already_refunded
-
-        if self.amount > max_refundable:
-            raise ValidationError(
-                f"Le montant à rembourser ({self.amount} $) dépasse le montant disponible ({max_refundable} $)."
-            )
-
-        if self.financial_account and self.financial_account.balance < self.amount:
-            raise ValidationError(
-                "Solde du compte insuffisant pour effectuer ce remboursement."
-            )
-
-    @transaction.atomic
-    def save(self, *args, **kwargs):
-        is_new = self.pk is None
-        self.full_clean()
-        super().save(*args, **kwargs)
-
-        if is_new:
-            self.financial_account.balance -= self.amount
-            self.financial_account.save(update_fields=["balance"])
-
-            CashMovement.objects.create(
-                account=self.financial_account,
-                movement_type=CashMovement.MovementType.REMBOURSEMENT,
-                amount=self.amount,
-                description=(
-                    f"Remboursement client : {self.reservation.reservation_number}. "
-                    f"Motif : {self.reason or 'N/A'}"
-                ),
-                reservation=self.reservation,
-                created_by=self.created_by,
-            )
-
-        self.reservation.recalculate_financials()
-
-        if self.reservation.payment_status == Reservation.PaymentStatus.REMBOURSE:
-            self.reservation.status = Reservation.Status.ANNULEE
-            self.reservation.save()
-
-    def __str__(self):
-        return f"Remboursement {self.amount} $ - {self.reservation.reservation_number}"
 
 
 # ============================================================
@@ -1000,36 +982,236 @@ class Contract(models.Model):
 
 
 # ============================================================
-# NOTIFICATION
+# REMBOURSEMENTS
 # ============================================================
-class Notification(models.Model):
-    class NotificationType(models.TextChoices):
-        RESERVATION = "RESERVATION", "Réservation"
-        PAIEMENT = "PAIEMENT", "Paiement"
-        DEPENSE = "DEPENSE", "Dépense"
-        SYSTEME = "SYSTEME", "Système"
 
-    user = models.ForeignKey(
+class Refund(models.Model):
+
+    class Method(models.TextChoices):
+        ESPECES = "ESPECES", "Espèces"
+        VIREMENT = "VIREMENT", "Virement bancaire"
+        MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
+
+    class Status(models.TextChoices):
+        VALIDE = "VALIDE", "Validé"
+        ANNULE = "ANNULE", "Annulé"
+
+    payment = models.ForeignKey(
+        Payment,
+        on_delete=models.PROTECT,
+        related_name="refunds",
+    )
+
+    reservation = models.ForeignKey(
+        Reservation,
+        on_delete=models.PROTECT,
+        related_name="refunds",
+    )
+
+    financial_account = models.ForeignKey(
+        FinancialAccount,
+        on_delete=models.PROTECT,
+        related_name="refunds",
+    )
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    refund_date = models.DateTimeField(
+        default=timezone.now,
+    )
+
+    method = models.CharField(
+        max_length=30,
+        choices=Method.choices,
+    )
+
+    reason = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.VALIDE,
+    )
+
+    created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="notifications",
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
+        related_name="created_refunds",
     )
-    title = models.CharField(max_length=200)
-    message = models.TextField()
-    notification_type = models.CharField(
-        max_length=30,
-        choices=NotificationType.choices,
-        default=NotificationType.SYSTEME,
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
     )
-    is_read = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
-        verbose_name = "Notification"
-        verbose_name_plural = "Notifications"
+        verbose_name = "Remboursement"
+        verbose_name_plural = "Remboursements"
+
+    def clean(self):
+        super().clean()
+
+        if self.amount is None or self.amount <= Decimal("0.00"):
+            raise ValidationError(
+                "Le montant du remboursement doit être supérieur à zéro."
+            )
+
+        if not self.payment_id:
+            raise ValidationError(
+                "Le paiement à rembourser est obligatoire."
+            )
+
+        if not self.reservation_id:
+            raise ValidationError(
+                "La réservation est obligatoire."
+            )
+
+        if self.payment.reservation_id != self.reservation_id:
+            raise ValidationError(
+                "Le paiement ne correspond pas à cette réservation."
+            )
+
+        if self.payment.status != Payment.Status.VALIDE:
+            raise ValidationError(
+                "Seul un paiement validé peut être remboursé."
+            )
+
+        if self.financial_account_id != self.payment.financial_account_id:
+            raise ValidationError(
+                "Le compte financier du remboursement doit "
+                "correspondre au compte du paiement."
+            )
+
+        # ----------------------------------------------------
+        # TOTAL DÉJÀ REMBOURSÉ SUR CE PAIEMENT
+        # ----------------------------------------------------
+
+        already_refunded = (
+            Refund.objects
+            .filter(
+                payment=self.payment,
+                status=Refund.Status.VALIDE,
+            )
+            .exclude(pk=self.pk)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        refundable_amount = self.payment.amount - already_refunded
+
+        if refundable_amount <= Decimal("0.00"):
+            raise ValidationError(
+                "Ce paiement a déjà été entièrement remboursé."
+            )
+
+        if self.amount > refundable_amount:
+            raise ValidationError(
+                (
+                    f"Le montant du remboursement ({self.amount} $) "
+                    f"dépasse le montant encore remboursable "
+                    f"({refundable_amount} $)."
+                )
+            )
+
+        # ----------------------------------------------------
+        # LE COMPTE DOIT AVOIR SUFFISAMMENT DE FONDS
+        # ----------------------------------------------------
+
+        if self.financial_account.balance < self.amount:
+            raise ValidationError(
+                (
+                    f"Solde insuffisant sur le compte "
+                    f"{self.financial_account.name}. "
+                    f"Solde disponible : "
+                    f"{self.financial_account.balance} $."
+                )
+            )
+
+    @property
+    def refundable_amount(self):
+        already_refunded = (
+            Refund.objects
+            .filter(
+                payment=self.payment,
+                status=Refund.Status.VALIDE,
+            )
+            .exclude(pk=self.pk)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        return max(
+            self.payment.amount - already_refunded,
+            Decimal("0.00"),
+        )
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+
+        is_new = self.pk is None
+
+        self.full_clean()
+
+        super().save(*args, **kwargs)
+
+        # ----------------------------------------------------
+        # SORTIE FINANCIÈRE
+        # ----------------------------------------------------
+
+        if (
+            is_new
+            and self.status == self.Status.VALIDE
+        ):
+            account = FinancialAccount.objects.select_for_update().get(
+                pk=self.financial_account_id
+            )
+
+            if account.balance < self.amount:
+                raise ValidationError(
+                    "Le solde du compte est insuffisant."
+                )
+
+            account.balance -= self.amount
+
+            account.save(
+                update_fields=["balance"]
+            )
+
+            CashMovement.objects.create(
+                account=account,
+                movement_type=CashMovement.MovementType.REMBOURSEMENT,
+                amount=self.amount,
+                description=(
+                    f"Remboursement paiement #{self.payment_id} "
+                    f"de la réservation "
+                    f"{self.reservation.reservation_number}"
+                ),
+                payment=self.payment,
+                reservation=self.reservation,
+                created_by=self.created_by,
+            )
+
+            self.reservation.recalculate_financials()
 
     def __str__(self):
-        return f"{self.title} - {self.user}"
+        return (
+            f"Remboursement #{self.id} - "
+            f"{self.amount} $ - "
+            f"{self.reservation.reservation_number}"
+        )
