@@ -819,10 +819,6 @@ class CashMovementSerializer(serializers.ModelSerializer):
 
 
 
-
-
-
-
 class ExpenseSerializer(serializers.ModelSerializer):
 
     category_display = serializers.CharField(
@@ -830,39 +826,53 @@ class ExpenseSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
-    account_name = serializers.CharField(
-        source="financial_account.name",
+    status_display = serializers.CharField(
+        source="get_status_display",
         read_only=True,
     )
 
-    class Meta:
+    created_by_name = serializers.SerializerMethodField(
+        read_only=True
+    )
 
+    class Meta:
         model = Expense
 
         fields = [
             "id",
+            "title",
             "category",
             "category_display",
-            "description",
             "amount",
             "expense_date",
-            "financial_account",
-            "account_name",
-            "created_by",
+            "status",
+            "status_display",
+            "notes",
             "created_at",
-            "updated_at",
+            "created_by",
+            "created_by_name",
         ]
 
         read_only_fields = [
             "id",
-            "financial_account",
-            "account_name",
-            "created_by",
+            "category_display",
+            "status_display",
             "created_at",
-            "updated_at",
+            "created_by",
+            "created_by_name",
         ]
 
+    def get_created_by_name(self, obj):
 
+        if not obj.created_by:
+            return ""
+
+        full_name = obj.created_by.get_full_name()
+
+        if full_name:
+            return full_name
+
+        return obj.created_by.username
 # ============================================================
 # CONTRACT
 # ============================================================
@@ -879,94 +889,28 @@ class ContractSerializer(serializers.ModelSerializer):
         ]
 
 
+
+
 class RefundSerializer(serializers.ModelSerializer):
-
-    reservation_number = serializers.CharField(
-        source="reservation.reservation_number",
-        read_only=True,
-    )
-
-    client_name = serializers.CharField(
-        source="reservation.client.full_name",
-        read_only=True,
-    )
-
-    payment_amount = serializers.DecimalField(
-        source="payment.amount",
-        max_digits=12,
-        decimal_places=2,
-        read_only=True,
-    )
-
-    already_refunded = serializers.SerializerMethodField()
-
-    refundable_amount = serializers.SerializerMethodField()
-
-    account_name = serializers.CharField(
-        source="financial_account.name",
-        read_only=True,
-    )
-
-    method_display = serializers.CharField(
-        source="get_method_display",
-        read_only=True,
-    )
-
-    status_display = serializers.CharField(
-        source="get_status_display",
-        read_only=True,
-    )
+    financial_account_name = serializers.ReadOnlyField(source="financial_account.name")
 
     class Meta:
         model = Refund
-
         fields = [
             "id",
-            "payment",
             "reservation",
-            "reservation_number",
-            "client_name",
             "financial_account",
-            "account_name",
-            "payment_amount",
-            "already_refunded",
-            "refundable_amount",
+            "financial_account_name",
             "amount",
-            "refund_date",
-            "method",
-            "method_display",
             "reason",
-            "reference",
             "status",
-            "status_display",
-            "created_by",
+            "refund_date",
             "created_at",
-        ]
-
-        read_only_fields = [
             "created_by",
-            "created_at",
         ]
+        read_only_fields = ["id", "created_at", "created_by"]
 
-    def get_already_refunded(self, obj):
-        total = (
-            Refund.objects
-            .filter(
-                payment=obj.payment,
-                status=Refund.Status.VALIDE,
-            )
-            .exclude(pk=obj.pk)
-            .aggregate(total=Sum("amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        return total
-
-    def get_refundable_amount(self, obj):
-        return max(
-            obj.payment.amount
-            - self.get_already_refunded(obj),
-            Decimal("0.00"),
-        )
-
+    def validate_amount(self, value):
+        if value <= Decimal("0.00"):
+            raise serializers.ValidationError("Le montant du remboursement doit être supérieur à 0.")
+        return value

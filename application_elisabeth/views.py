@@ -112,74 +112,36 @@ class ClientViewSet(viewsets.ModelViewSet):
 # SALLES
 # ============================================================
 
+
 class HallViewSet(viewsets.ModelViewSet):
-    queryset = Hall.objects.all().prefetch_related(
+    queryset = Hall.objects.prefetch_related(
         "images",
         "videos",
-    )
+    ).all()
 
     serializer_class = HallSerializer
 
     parser_classes = [
-        MultiPartParser,
+        MultiPartParser, 
         FormParser,
         JSONParser,
     ]
 
+    permission_classes = [IsAuthenticated]
+
     def create(self, request, *args, **kwargs):
-        """
-        Création d'une salle avec éventuellement plusieurs
-        images et plusieurs vidéos.
-        """
-
-        # -----------------------------
-        # DONNÉES DE LA SALLE
-        # -----------------------------
-        name = request.data.get("name")
-        description = request.data.get("description", "")
-        capacity = request.data.get("capacity", 0)
-        price = request.data.get("price", 0)
-        is_active = request.data.get("is_active", "true")
-
-        if not name:
-            return Response(
-                {
-                    "name": [
-                        "Le nom de la salle est obligatoire."
-                    ]
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Conversion du booléen envoyé par FormData
-        if isinstance(is_active, str):
-            is_active = is_active.lower() in [
-                "true",
-                "1",
-                "yes",
-                "on",
-            ]
-
-        # -----------------------------
-        # CRÉATION DE LA SALLE
-        # -----------------------------
         serializer = self.get_serializer(
-            data={
-                "name": name,
-                "description": description,
-                "capacity": capacity,
-                "price": price,
-                "is_active": is_active,
-            }
+            data=request.data
         )
 
         serializer.is_valid(raise_exception=True)
 
         hall = serializer.save()
 
-        # -----------------------------
+        # =====================================================
         # IMAGES
-        # -----------------------------
+        # =====================================================
+
         images = request.FILES.getlist("images")
 
         for image in images:
@@ -188,9 +150,10 @@ class HallViewSet(viewsets.ModelViewSet):
                 image=image,
             )
 
-        # -----------------------------
-        # VIDÉOS
-        # -----------------------------
+        # =====================================================
+        # VIDEOS
+        # =====================================================
+
         videos = request.FILES.getlist("videos")
 
         for video in videos:
@@ -199,45 +162,46 @@ class HallViewSet(viewsets.ModelViewSet):
                 video=video,
             )
 
-        # -----------------------------
-        # RÉPONSE FINALE
-        # -----------------------------
-        output_serializer = self.get_serializer(
-            hall,
-            context={
-                "request": request,
-            },
+        # =====================================================
+        # REPONSE
+        # =====================================================
+
+        response_serializer = self.get_serializer(
+            hall
         )
 
         return Response(
-            output_serializer.data,
+            response_serializer.data,
             status=status.HTTP_201_CREATED,
         )
 
     def update(self, request, *args, **kwargs):
-        """
-        Modification d'une salle.
+        partial = kwargs.pop(
+            "partial",
+            False,
+        )
 
-        Les nouvelles images/vidéos peuvent également être ajoutées.
-        Les anciennes ne sont pas supprimées automatiquement.
-        """
-
-        partial = kwargs.pop("partial", False)
-
-        hall = self.get_object()
+        instance = self.get_object()
 
         serializer = self.get_serializer(
-            hall,
+            instance,
             data=request.data,
             partial=partial,
         )
 
-        serializer.is_valid(raise_exception=True)
+        serializer.is_valid(
+            raise_exception=True
+        )
 
         hall = serializer.save()
 
-        # Ajouter de nouvelles images si présentes
-        images = request.FILES.getlist("images")
+        # =====================================================
+        # NOUVELLES IMAGES
+        # =====================================================
+
+        images = request.FILES.getlist(
+            "images"
+        )
 
         for image in images:
             HallImage.objects.create(
@@ -245,8 +209,13 @@ class HallViewSet(viewsets.ModelViewSet):
                 image=image,
             )
 
-        # Ajouter de nouvelles vidéos si présentes
-        videos = request.FILES.getlist("videos")
+        # =====================================================
+        # NOUVELLES VIDEOS
+        # =====================================================
+
+        videos = request.FILES.getlist(
+            "videos"
+        )
 
         for video in videos:
             HallVideo.objects.create(
@@ -254,32 +223,14 @@ class HallViewSet(viewsets.ModelViewSet):
                 video=video,
             )
 
-        output_serializer = self.get_serializer(
-            hall,
-            context={
-                "request": request,
-            },
+        response_serializer = self.get_serializer(
+            hall
         )
-
-        return Response(output_serializer.data)
-
-    def destroy(self, request, *args, **kwargs):
-        """
-        Suppression de la salle.
-        Les images et vidéos associées sont supprimées
-        automatiquement grâce à on_delete=CASCADE.
-        """
-
-        hall = self.get_object()
-
-        hall.delete()
 
         return Response(
-            {
-                "detail": "Salle supprimée avec succès."
-            },
-            status=status.HTTP_204_NO_CONTENT,
+            response_serializer.data
         )
+
 
 
 class HallImageViewSet(viewsets.ModelViewSet):
@@ -314,77 +265,6 @@ class MaterialViewSet(viewsets.ModelViewSet):
     serializer_class = MaterialSerializer
     permission_classes = [IsAuthenticated]
 
-
-# ============================================================
-# RESERVATIONS
-# ============================================================
-
-class ReservationViewSet(viewsets.ModelViewSet): 
-    queryset = ( 
-        Reservation.objects 
-        .select_related("client", "hall", "tarif") 
-        .prefetch_related("payments", "refunds") 
-        .order_by("-event_date") 
-    ) 
-    serializer_class = ReservationSerializer 
-    permission_classes = [IsAuthenticated] 
-
-    def perform_create(self, serializer): 
-        reservation = serializer.save(created_by=self.request.user) 
-
-        client_name = reservation.client.full_name if reservation.client else "Non renseigné" 
-        send_notification( 
-            subject="Nouvelle réservation", 
-            message=( 
-                f"La réservation {reservation.reservation_number} a été créée.\n\n" 
-                f"Client : {client_name}\n" 
-                f"Date : {reservation.event_date}\n" 
-                f"Événement : {reservation.event_type or 'Non renseigné'}" 
-            ), 
-        ) 
-
-    def perform_update(self, serializer): 
-        old_status = serializer.instance.status 
-        reservation = serializer.save() 
-
-        if old_status != Reservation.Status.CONFIRMEE and reservation.status == Reservation.Status.CONFIRMEE: 
-            send_notification( 
-                subject="Réservation confirmée", 
-                message=f"La réservation {reservation.reservation_number} est maintenant confirmée.", 
-            ) 
-
-    @action(detail=True, methods=["post"], url_path="confirmer") 
-    def confirmer(self, request, pk=None): 
-        reservation = self.get_object() 
-
-        if reservation.status == Reservation.Status.ANNULEE: 
-            return Response( 
-                {"detail": "Une réservation annulée ne peut pas être confirmée."}, 
-                status=status.HTTP_400_BAD_REQUEST, 
-            ) 
-
-        reservation.status = Reservation.Status.CONFIRMEE 
-        reservation.save() 
-
-        send_notification( 
-            subject="Réservation confirmée", 
-            message=f"La réservation {reservation.reservation_number} est maintenant confirmée.", 
-        ) 
-
-        return Response(ReservationSerializer(reservation, context={"request": request}).data) 
-
-    @action(detail=True, methods=["post"], url_path="annuler") 
-    def annuler(self, request, pk=None): 
-        reservation = self.get_object() 
-        reservation.status = Reservation.Status.ANNULEE 
-        reservation.save() 
-
-        send_notification( 
-            subject="Réservation annulée", 
-            message=f"La réservation {reservation.reservation_number} a été annulée.", 
-        ) 
-
-        return Response(ReservationSerializer(reservation, context={"request": request}).data)
 
 
 # ============================================================
@@ -1165,6 +1045,8 @@ class ReservationViewSet(viewsets.ModelViewSet):
         )
 
 
+
+
 # ============================================================
 # DEPENSES
 # ============================================================
@@ -1173,10 +1055,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     queryset = (
         Expense.objects
-        .select_related(
-            "financial_account",
-            "created_by",
-        )
+        .select_related("created_by")
         .all()
         .order_by("-expense_date", "-id")
     )
@@ -1184,44 +1063,128 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     serializer_class = ExpenseSerializer
     permission_classes = [IsAuthenticated]
 
+    # ========================================================
+    # CREATION
+    # ========================================================
+
     @transaction.atomic
     def perform_create(self, serializer):
 
-        caisse = (
-            FinancialAccount.objects
-            .filter(
-                account_type=FinancialAccount.AccountType.CAISSE,
-                is_active=True,
-            )
-            .order_by("id")
-            .first()
+        serializer.save(
+            created_by=self.request.user
         )
 
-        if not caisse:
-            raise serializers.ValidationError({
-                "detail": (
-                    "Aucun compte Caisse actif n'existe. "
-                    "Veuillez créer une caisse avant "
-                    "d'enregistrer une dépense."
-                )
-            })
+        expense = serializer.instance
 
-        expense = serializer.save(
-            financial_account=caisse,
-            created_by=self.request.user,
-        )
-
-        Notification.objects.create(
-            user=self.request.user,
-            notification_type=(
-                Notification.NotificationType.EXPENSE_CREATED
-            ),
-            title="Dépense enregistrée",
+        send_notification(
+            subject="Nouvelle dépense",
             message=(
-                f"Une dépense de {expense.amount} $ "
-                f"a été enregistrée : "
-                f"{expense.description}"
+                f"Une nouvelle dépense a été enregistrée.\n\n"
+                f"Titre : {expense.title}\n"
+                f"Catégorie : "
+                f"{expense.get_category_display()}\n"
+                f"Montant : {expense.amount} $\n"
+                f"Statut : "
+                f"{expense.get_status_display()}"
             ),
+        )
+
+    # ========================================================
+    # MODIFICATION
+    # ========================================================
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+
+        serializer.save()
+
+    # ========================================================
+    # PAYER UNE DEPENSE
+    # ========================================================
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="payer",
+    )
+    @transaction.atomic
+    def payer(self, request, pk=None):
+
+        expense = (
+            Expense.objects
+            .select_for_update()
+            .select_related("created_by")
+            .get(pk=pk)
+        )
+
+        # ----------------------------------------------------
+        # DEJA PAYEE
+        # ----------------------------------------------------
+
+        if expense.status == Expense.Status.PAYEE:
+
+            return Response(
+                {
+                    "detail": (
+                        "Cette dépense est déjà payée."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ----------------------------------------------------
+        # ANNULEE
+        # ----------------------------------------------------
+
+        if expense.status == Expense.Status.ANNULEE:
+
+            return Response(
+                {
+                    "detail": (
+                        "Une dépense annulée "
+                        "ne peut pas être payée."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ----------------------------------------------------
+        # PASSAGE A PAYEE
+        # ----------------------------------------------------
+        #
+        # Le modèle Expense.save() s'occupe automatiquement :
+        #
+        # - de trouver la caisse active ;
+        # - vérifier le solde ;
+        # - diminuer la caisse ;
+        # - créer CashMovement SORTIE.
+        #
+
+        expense.status = Expense.Status.PAYEE
+
+        expense.save(
+            update_fields=[
+                "status",
+            ]
+        )
+
+        send_notification(
+            subject="Dépense payée",
+            message=(
+                f"La dépense #{expense.id} a été payée.\n\n"
+                f"Titre : {expense.title}\n"
+                f"Montant : {expense.amount} $"
+            ),
+        )
+
+        return Response(
+            ExpenseSerializer(
+                expense,
+                context={
+                    "request": request,
+                },
+            ).data,
+            status=status.HTTP_200_OK,
         )
 
 # ============================================================
@@ -1377,11 +1340,13 @@ def dashboard_report(request):
     """
     Tableau de bord global de l'application.
 
-    Les montants des réservations sont récupérés depuis
-    Reservation.tarif.amount.
-
-    Les montants réellement encaissés proviennent uniquement
-    des paiements VALIDES.
+    Sources financières :
+    - chiffre d'affaires théorique : tarifs des réservations non annulées
+    - encaissements : paiements VALIDES
+    - dépenses : Expense
+    - remboursements : Refund
+    - soldes : FinancialAccount
+    - mouvements : CashMovement
     """
 
     # ========================================================
@@ -1395,7 +1360,7 @@ def dashboard_report(request):
             "hall",
             "tarif",
         )
-        .prefetch_related("payments")
+        .prefetch_related("payments", "refunds")
         .all()
     )
 
@@ -1437,16 +1402,6 @@ def dashboard_report(request):
     # ========================================================
     # CHIFFRE D'AFFAIRES THEORIQUE
     # ========================================================
-    #
-    # Reservation ne possède PAS total_amount.
-    #
-    # Le montant est porté par :
-    #
-    # reservation.tarif.amount
-    #
-    # On additionne donc les tarifs des réservations
-    # non annulées.
-    # ========================================================
 
     chiffre_affaires = Decimal("0.00")
 
@@ -1455,7 +1410,7 @@ def dashboard_report(request):
         if reservation.status == Reservation.Status.ANNULEE:
             continue
 
-        if reservation.tarif:
+        if reservation.tarif_id:
             chiffre_affaires += (
                 reservation.tarif.amount
                 or Decimal("0.00")
@@ -1480,6 +1435,9 @@ def dashboard_report(request):
 
     total_depenses = (
         expenses
+        .exclude(
+            status=Expense.Status.ANNULEE
+        )
         .aggregate(
             total=Sum("amount")
         )
@@ -1488,11 +1446,14 @@ def dashboard_report(request):
     )
 
     # ========================================================
-    # REMBOURSEMENTS
+    # REMBOURSEMENTS VALIDES
     # ========================================================
 
     total_rembourse = (
         refunds
+        .filter(
+            status=Refund.Status.VALIDE
+        )
         .aggregate(
             total=Sum("amount")
         )
@@ -1502,14 +1463,6 @@ def dashboard_report(request):
 
     # ========================================================
     # RESTE A RECOUVRER
-    # ========================================================
-    #
-    # Il n'existe pas de remaining_amount sur Reservation.
-    #
-    # On calcule :
-    #
-    # tarif - paiements validés liés à la réservation
-    #
     # ========================================================
 
     reste_a_recouvrer = Decimal("0.00")
@@ -1521,7 +1474,7 @@ def dashboard_report(request):
 
         montant_reservation = Decimal("0.00")
 
-        if reservation.tarif:
+        if reservation.tarif_id:
             montant_reservation = (
                 reservation.tarif.amount
                 or Decimal("0.00")
@@ -1530,7 +1483,7 @@ def dashboard_report(request):
         montant_paye = (
             payments
             .filter(
-                reservation=reservation
+                reservation_id=reservation.id
             )
             .aggregate(
                 total=Sum("amount")
@@ -1539,7 +1492,27 @@ def dashboard_report(request):
             or Decimal("0.00")
         )
 
-        reste = montant_reservation - montant_paye
+        montant_rembourse = (
+            refunds
+            .filter(
+                reservation_id=reservation.id,
+                status=Refund.Status.VALIDE,
+            )
+            .aggregate(
+                total=Sum("amount")
+            )
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        montant_net_paye = (
+            montant_paye - montant_rembourse
+        )
+
+        reste = (
+            montant_reservation
+            - montant_net_paye
+        )
 
         if reste > Decimal("0.00"):
             reste_a_recouvrer += reste
@@ -1579,10 +1552,14 @@ def dashboard_report(request):
             "id": account.id,
             "name": account.name,
             "account_type": account.account_type,
+            "account_type_display": (
+                account.get_account_type_display()
+            ),
             "balance": float(
                 account.balance
                 or Decimal("0.00")
             ),
+            "is_active": account.is_active,
         })
 
     # ========================================================
@@ -1595,7 +1572,9 @@ def dashboard_report(request):
 
         total = (
             payments
-            .filter(method=method)
+            .filter(
+                method=method
+            )
             .aggregate(
                 total=Sum("amount")
             )
@@ -1612,14 +1591,36 @@ def dashboard_report(request):
     # ========================================================
     # DEPENSES PAR CATEGORIE
     # ========================================================
+    #
+    # Expense.category est actuellement un CharField simple.
+    #
+    # Il n'existe donc PAS :
+    #
+    # Expense.ExpenseType.choices
+    #
+    # Les catégories utilisées par le formulaire sont définies
+    # ici de manière cohérente avec le frontend.
+    # ========================================================
+
+    expense_categories = [
+        ("EAU", "Eau"),
+        ("ELECTRICITE", "Électricité"),
+        ("SALAIRE", "Salaire"),
+        ("AUTRE", "Autre"),
+    ]
 
     depenses_par_categorie = []
 
-    for category, label in Expense.ExpenseType.choices:
+    for category, label in expense_categories:
 
         total = (
             expenses
-            .filter(category=category)
+            .filter(
+                category=category
+            )
+            .exclude(
+                status=Expense.Status.ANNULEE
+            )
             .aggregate(
                 total=Sum("amount")
             )
@@ -1653,10 +1654,6 @@ def dashboard_report(request):
 
     # ========================================================
     # REVENUS MENSUELS
-    # ========================================================
-    #
-    # Ici on utilise les paiements VALIDES.
-    # Cela représente les encaissements réels par mois.
     # ========================================================
 
     revenus_mensuels = (
@@ -1697,6 +1694,9 @@ def dashboard_report(request):
 
     depenses_mensuelles = (
         expenses
+        .exclude(
+            status=Expense.Status.ANNULEE
+        )
         .filter(
             expense_date__isnull=False
         )
@@ -1746,10 +1746,7 @@ def dashboard_report(request):
     total_sorties = (
         movements
         .filter(
-            movement_type__in=[
-                CashMovement.MovementType.SORTIE,
-                CashMovement.MovementType.REMBOURSEMENT,
-            ]
+            movement_type=CashMovement.MovementType.SORTIE
         )
         .aggregate(
             total=Sum("amount")
@@ -1822,8 +1819,6 @@ def dashboard_report(request):
             "expenses": depenses_chart,
         },
     })
-
-
 # ============================================================
 # EXPORT EXCEL
 # ============================================================
@@ -1859,7 +1854,7 @@ def dashboard_excel(request):
     expenses = (
         Expense.objects
         .select_related(
-            "financial_account"
+            "created_by"
         )
         .all()
     )
@@ -2573,102 +2568,63 @@ def dashboard_pdf(request):
 
 
 class RefundViewSet(viewsets.ModelViewSet):
-
-    queryset = (
-        Refund.objects
-        .select_related(
-            "payment",
-            "reservation",
-            "reservation__client",
-            "financial_account",
-            "created_by",
-        )
-        .all()
-    )
-
+    queryset = Refund.objects.select_related("reservation", "financial_account", "created_by").all()
     serializer_class = RefundSerializer
+    permission_classes = [IsAuthenticated]
 
-    permission_classes = [
-        IsAuthenticated,
-    ]
-
+    @transaction.atomic
     def perform_create(self, serializer):
+        refund = serializer.save(created_by=self.request.user)
+        if refund.status == Refund.Status.VALIDE:
+            self._process_refund_payout(refund, self.request.user)
 
-        with transaction.atomic():
+    @action(detail=True, methods=["post"], url_path="valider")
+    @transaction.atomic
+    def valider(self, request, pk=None):
+        refund = Refund.objects.select_for_update().get(pk=pk)
 
-            payment_id = serializer.validated_data["payment"].id
-
-            payment = (
-                Payment.objects
-                .select_for_update()
-                .select_related(
-                    "reservation",
-                    "financial_account",
-                )
-                .get(pk=payment_id)
+        if refund.status == Refund.Status.VALIDE:
+            return Response(
+                {"detail": "Ce remboursement est déjà validé."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-            if payment.status != Payment.Status.VALIDE:
-                raise ValidationError(
-                    "Seul un paiement validé peut être remboursé."
-                )
+        self._process_refund_payout(refund, request.user)
 
-            if not payment.reservation:
-                raise ValidationError(
-                    "Ce paiement n'est lié à aucune réservation."
-                )
+        refund.status = Refund.Status.VALIDE
+        refund.save(update_fields=["status"])
 
-            refund_amount = serializer.validated_data["amount"]
+        # Recalculer le bilan financier de la réservation
+        if refund.reservation:
+            refund.reservation.recalculate_financials()
 
-            already_refunded = (
-                Refund.objects
-                .filter(
-                    payment=payment,
-                    status=Refund.Status.VALIDE,
-                )
-                .aggregate(total=Sum("amount"))
-                .get("total")
-                or Decimal("0.00")
+        return Response(RefundSerializer(refund, context={"request": request}).data)
+
+    def _process_refund_payout(self, refund, user):
+        account = FinancialAccount.objects.select_for_update().get(pk=refund.financial_account_id)
+
+        if account.balance < refund.amount:
+            raise serializers.ValidationError({
+                "detail": f"Solde insuffisant dans la caisse '{account.name}' pour effectuer ce remboursement. Solde actuel : {account.balance} $."
+            })
+
+        movement_exists = CashMovement.objects.filter(
+            refund=refund,
+            movement_type=CashMovement.MovementType.SORTIE,
+        ).exists()
+
+        if not movement_exists:
+            # 1. Diminuer le solde de la caisse
+            account.balance -= refund.amount
+            account.save(update_fields=["balance"])
+
+            # 2. Créer la sortie de caisse
+            CashMovement.objects.create(
+                account=account,
+                refund=refund,
+                reservation=refund.reservation,
+                movement_type=CashMovement.MovementType.SORTIE,
+                amount=refund.amount,
+                description=f"Sortie Remboursement #{refund.id} - Réservation #{refund.reservation_id}",
+                created_by=user,
             )
-
-            refundable_amount = (
-                payment.amount - already_refunded
-            )
-
-            if refund_amount > refundable_amount:
-                raise ValidationError(
-                    (
-                        f"Montant impossible. "
-                        f"Montant maximum remboursable : "
-                        f"{refundable_amount} $."
-                    )
-                )
-
-            if not payment.financial_account:
-                raise ValidationError(
-                    "Ce paiement n'est associé à aucun compte financier."
-                )
-
-            account = (
-                FinancialAccount.objects
-                .select_for_update()
-                .get(pk=payment.financial_account_id)
-            )
-
-            if account.balance < refund_amount:
-                raise ValidationError(
-                    (
-                        f"Solde insuffisant sur "
-                        f"{account.name}. "
-                        f"Solde disponible : "
-                        f"{account.balance} $."
-                    )
-                )
-
-            serializer.save(
-                reservation=payment.reservation,
-                financial_account=account,
-                created_by=self.request.user,
-            )
-
-

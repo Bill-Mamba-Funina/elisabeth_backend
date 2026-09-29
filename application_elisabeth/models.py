@@ -513,37 +513,21 @@ class Reservation(models.Model):
 # ============================================================
 class FinancialAccount(models.Model):
     class AccountType(models.TextChoices):
-        CAISSE = "CAISSE", "Caisse"
-        BANQUE = "BANQUE", "Banque"
-        MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
+        CASH = "CASH", "Caisse"
+        BANK = "BANK", "Banque"
+        MOBILE_MONEY = "MOBILE", "Mobile Money"
 
-    name = models.CharField(
-        max_length=150,
-    )
+    name = models.CharField(max_length=100)
     account_type = models.CharField(
-        max_length=30,
-        choices=AccountType.choices,
+        max_length=20, choices=AccountType.choices, default=AccountType.CASH
     )
     balance = models.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        default=Decimal("0.00"),
+        max_length=12, max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
-    is_active = models.BooleanField(
-        default=True,
-    )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-
-    class Meta:
-        ordering = ["name"]
-        verbose_name = "Compte financier"
-        verbose_name_plural = "Comptes financiers"
+    is_active = models.BooleanField(default=True)
 
     def __str__(self):
-        return f"{self.name} - {self.balance} $"
-
+        return f"{self.name} ({self.get_account_type_display()}) - Solde: {self.balance} $"
 
 
 # ============================================================
@@ -788,92 +772,90 @@ class Payment(models.Model):
 # ============================================================
 class CashMovement(models.Model):
     class MovementType(models.TextChoices):
-        ENTREE = "ENTREE", "Entrée"
-        SORTIE = "SORTIE", "Sortie"
-        TRANSFERT = "TRANSFERT", "Transfert"
-        CORRECTION = "CORRECTION", "Correction"
-        REMBOURSEMENT = "REMBOURSEMENT", "Remboursement"
+        ENTREE = "ENTREE", "Entrée (Paiement)"
+        SORTIE = "SORTIE", "Sortie (Dépense / Remboursement)"
 
     account = models.ForeignKey(
-        FinancialAccount,
-        on_delete=models.PROTECT,
-        related_name="movements",
+        FinancialAccount, on_delete=models.PROTECT, related_name="movements"
     )
-    movement_type = models.CharField(
-        max_length=30,
-        choices=MovementType.choices,
-    )
-    amount = models.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-    )
-    description = models.CharField(
-        max_length=255,
-    )
+    movement_type = models.CharField(max_length=10, choices=MovementType.choices)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    description = models.CharField(max_length=255, blank=True)
+    
+    # Liens explicites vers les entités génératrices
     payment = models.ForeignKey(
-        Payment,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="movements",
+        "Payment", on_delete=models.CASCADE, null=True, blank=True, related_name="cash_movements"
+    )
+    expense = models.ForeignKey(
+        "Expense", on_delete=models.CASCADE, null=True, blank=True, related_name="cash_movements"
+    )
+    refund = models.ForeignKey(
+        "Refund", on_delete=models.CASCADE, null=True, blank=True, related_name="cash_movements"
     )
     reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="financial_movements",
+        "Reservation", on_delete=models.SET_NULL, null=True, blank=True
     )
+    
+    created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="created_movements",
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
     )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-
-    class Meta:
-        ordering = ["-created_at"]
-        verbose_name = "Mouvement de caisse"
-        verbose_name_plural = "Mouvements de caisse"
 
     def __str__(self):
-        return f"{self.movement_type} - {self.amount} $"
+        return f"[{self.movement_type}] {self.amount} $ - {self.account.name}"
+
+
 
 
 # ============================================================
 # DEPENSES
 # ============================================================
+
 class Expense(models.Model):
-    class ExpenseType(models.TextChoices):
+    class Category(models.TextChoices):
         EAU = "EAU", "Eau"
         ELECTRICITE = "ELECTRICITE", "Électricité"
         SALAIRE = "SALAIRE", "Salaire"
         AUTRE = "AUTRE", "Autre"
 
-    category = models.CharField(
-        max_length=150,
-        choices=ExpenseType.choices,
-        default=ExpenseType.AUTRE,
+    class Status(models.TextChoices):
+        EN_ATTENTE = "EN_ATTENTE", "En attente"
+        PAYEE = "PAYEE", "Payée"
+        ANNULEE = "ANNULEE", "Annulée"
+
+    title = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
     )
-    description = models.TextField()
+
+    category = models.CharField(
+        max_length=30,
+        choices=Category.choices,
+    )
+
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
     )
-    expense_date = models.DateTimeField(
-        default=timezone.now,
+
+    expense_date = models.DateField()
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.EN_ATTENTE,
     )
-    financial_account = models.ForeignKey(
-        FinancialAccount,
-        on_delete=models.PROTECT,
-        related_name="expenses",
-        null=True,
+
+    notes = models.TextField(
         blank=True,
+        default="",
     )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -881,70 +863,242 @@ class Expense(models.Model):
         blank=True,
         related_name="created_expenses",
     )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-    updated_at = models.DateTimeField(
-        auto_now=True,
-    )
 
     class Meta:
-        ordering = ["-expense_date"]
+        ordering = ["-created_at"]
         verbose_name = "Dépense"
         verbose_name_plural = "Dépenses"
+
+    def __str__(self):
+        return f"Dépense : {self.title} - {self.amount} $"
 
     def clean(self):
         super().clean()
 
-        if self.amount is not None and self.amount <= Decimal("0.00"):
+        # ----------------------------------------------------
+        # MONTANT
+        # ----------------------------------------------------
+
+        if self.amount is None:
+            raise ValidationError(
+                "Le montant de la dépense est obligatoire."
+            )
+
+        if self.amount <= Decimal("0.00"):
             raise ValidationError(
                 "Le montant de la dépense doit être supérieur à zéro."
             )
 
-        # Récupération automatique de la caisse principale si le compte n'est pas spécifié
-        if not self.financial_account:
-            caisse_account = FinancialAccount.objects.filter(
-                account_type=FinancialAccount.AccountType.CAISSE,
-                is_active=True,
-            ).first()
+        # ----------------------------------------------------
+        # TYPE DE DEPENSE
+        # ----------------------------------------------------
 
-            if not caisse_account:
-                raise ValidationError(
-                    "Aucun compte de Caisse actif n'a été trouvé dans le système."
-                )
-            self.financial_account = caisse_account
-
-        # Récupération du total/solde de la caisse et validation du montant
-        caisse_balance = self.financial_account.balance
-        if self.amount and caisse_balance < self.amount:
+        if not self.category:
             raise ValidationError(
-                f"Opération impossible : Le montant de la dépense ({self.amount} $) "
-                f"est supérieur au solde disponible en Caisse ({caisse_balance} $)."
+                "Le type de dépense est obligatoire."
             )
 
-    @transaction.atomic
+        # ----------------------------------------------------
+        # TITRE
+        # ----------------------------------------------------
+
+        if self.category == self.Category.AUTRE:
+            if not self.title or not self.title.strip():
+                raise ValidationError(
+                    "Le titre est obligatoire lorsque le type est « Autre »."
+                )
+
+            self.title = self.title.strip()
+
+        else:
+            # Pour Eau, Électricité et Salaire,
+            # le titre est automatiquement déterminé.
+            self.title = self.get_category_display()
+
+    @staticmethod
+    def get_active_cash_account():
+        """
+        Retourne la caisse active.
+
+        Une seule caisse active est normalement utilisée
+        pour les dépenses.
+        """
+
+        account = (
+            FinancialAccount.objects
+            .select_for_update()
+            .filter(
+                account_type=FinancialAccount.AccountType.CASH,
+                is_active=True,
+            )
+            .first()
+        )
+
+        if not account:
+            raise ValidationError(
+                "Aucune caisse active n'existe. "
+                "Veuillez créer ou activer une caisse avant "
+                "d'enregistrer une dépense payée."
+            )
+
+        return account
+
     def save(self, *args, **kwargs):
-        is_new = self.pk is None
-        self.full_clean()
-        super().save(*args, **kwargs)
+        """
+        Enregistre la dépense.
 
-        if is_new and self.financial_account:
-            self.financial_account.balance -= self.amount
-            self.financial_account.save(update_fields=["balance"])
+        Si le statut devient PAYEE pour la première fois :
+        - récupère la caisse active ;
+        - vérifie le solde ;
+        - diminue la caisse ;
+        - crée un mouvement SORTIE.
 
-            CashMovement.objects.create(
-                account=self.financial_account,
-                movement_type=CashMovement.MovementType.SORTIE,
-                amount=self.amount,
-                description=(
-                    f"Dépense [{self.get_category_display()}] : "
-                    f"{self.description[:100]}"
-                ),
-                created_by=self.created_by,
+        Une dépense déjà payée ne diminue pas une deuxième fois
+        simplement parce qu'elle est sauvegardée.
+        """
+
+        with transaction.atomic():
+
+            # ------------------------------------------------
+            # ETAT PRECEDENT
+            # ------------------------------------------------
+
+            old_expense = None
+
+            if self.pk:
+                old_expense = (
+                    Expense.objects
+                    .select_for_update()
+                    .filter(pk=self.pk)
+                    .first()
+                )
+
+            old_status = (
+                old_expense.status
+                if old_expense
+                else None
             )
 
-    def __str__(self):
-        return f"{self.category} - {self.amount} $"
+            old_amount = (
+                old_expense.amount
+                if old_expense
+                else Decimal("0.00")
+            )
+
+            # ------------------------------------------------
+            # VALIDATION
+            # ------------------------------------------------
+
+            self.full_clean()
+
+            # ------------------------------------------------
+            # PREMIERE SAUVEGARDE
+            # ------------------------------------------------
+
+            super().save(*args, **kwargs)
+
+            # ------------------------------------------------
+            # CAS 1 :
+            # DEPENSE NON PAYEE
+            # ------------------------------------------------
+
+            if self.status != self.Status.PAYEE:
+                return
+
+            # ------------------------------------------------
+            # CAS 2 :
+            # NOUVELLE DEPENSE PAYEE
+            # ------------------------------------------------
+
+            if old_expense is None:
+
+                cash_account = self.get_active_cash_account()
+
+                if cash_account.balance < self.amount:
+                    raise ValidationError(
+                        (
+                            f"Solde de caisse insuffisant. "
+                            f"Solde disponible : "
+                            f"{cash_account.balance} $. "
+                            f"Montant de la dépense : "
+                            f"{self.amount} $."
+                        )
+                    )
+
+                cash_account.balance -= self.amount
+                cash_account.save(
+                    update_fields=["balance"]
+                )
+
+                CashMovement.objects.create(
+                    account=cash_account,
+                    movement_type=CashMovement.MovementType.SORTIE,
+                    amount=self.amount,
+                    description=(
+                        f"Dépense payée : {self.title}"
+                    ),
+                    expense=self,
+                    created_by=self.created_by,
+                )
+
+                return
+
+            # ------------------------------------------------
+            # CAS 3 :
+            # EN ATTENTE -> PAYEE
+            # ------------------------------------------------
+
+            if (
+                old_status != self.Status.PAYEE
+                and self.status == self.Status.PAYEE
+            ):
+
+                cash_account = self.get_active_cash_account()
+
+                if cash_account.balance < self.amount:
+                    raise ValidationError(
+                        (
+                            f"Solde de caisse insuffisant. "
+                            f"Solde disponible : "
+                            f"{cash_account.balance} $. "
+                            f"Montant de la dépense : "
+                            f"{self.amount} $."
+                        )
+                    )
+
+                cash_account.balance -= self.amount
+                cash_account.save(
+                    update_fields=["balance"]
+                )
+
+                CashMovement.objects.create(
+                    account=cash_account,
+                    movement_type=CashMovement.MovementType.SORTIE,
+                    amount=self.amount,
+                    description=(
+                        f"Dépense payée : {self.title}"
+                    ),
+                    expense=self,
+                    created_by=self.created_by,
+                )
+
+                return
+
+            # ------------------------------------------------
+            # CAS 4 :
+            # DEPENSE DEJA PAYEE MAIS MONTANT MODIFIE
+            # ------------------------------------------------
+
+            if (
+                old_status == self.Status.PAYEE
+                and self.status == self.Status.PAYEE
+                and old_amount != self.amount
+            ):
+                raise ValidationError(
+                    "Une dépense déjà payée ne peut pas être "
+                    "modifiée directement. Utilisez une correction "
+                    "ou une opération financière dédiée."
+                )
 
 
 # ============================================================
@@ -986,232 +1140,27 @@ class Contract(models.Model):
 # ============================================================
 
 class Refund(models.Model):
-
-    class Method(models.TextChoices):
-        ESPECES = "ESPECES", "Espèces"
-        VIREMENT = "VIREMENT", "Virement bancaire"
-        MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
-
     class Status(models.TextChoices):
+        EN_ATTENTE = "EN_ATTENTE", "En attente"
         VALIDE = "VALIDE", "Validé"
         ANNULE = "ANNULE", "Annulé"
 
-    payment = models.ForeignKey(
-        Payment,
-        on_delete=models.PROTECT,
-        related_name="refunds",
-    )
-
     reservation = models.ForeignKey(
-        Reservation,
-        on_delete=models.PROTECT,
-        related_name="refunds",
+        "Reservation", on_delete=models.CASCADE, related_name="refunds"
     )
-
     financial_account = models.ForeignKey(
-        FinancialAccount,
-        on_delete=models.PROTECT,
-        related_name="refunds",
+        FinancialAccount, on_delete=models.PROTECT, related_name="refunds"
     )
-
-    amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-    )
-
-    refund_date = models.DateTimeField(
-        default=timezone.now,
-    )
-
-    method = models.CharField(
-        max_length=30,
-        choices=Method.choices,
-    )
-
-    reason = models.TextField(
-        blank=True,
-        null=True,
-    )
-
-    reference = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    reason = models.TextField(blank=True)
     status = models.CharField(
-        max_length=20,
-        choices=Status.choices,
-        default=Status.VALIDE,
+        max_length=20, choices=Status.choices, default=Status.EN_ATTENTE
     )
-
+    refund_date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="created_refunds",
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
     )
-
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-
-    class Meta:
-        ordering = ["-created_at"]
-        verbose_name = "Remboursement"
-        verbose_name_plural = "Remboursements"
-
-    def clean(self):
-        super().clean()
-
-        if self.amount is None or self.amount <= Decimal("0.00"):
-            raise ValidationError(
-                "Le montant du remboursement doit être supérieur à zéro."
-            )
-
-        if not self.payment_id:
-            raise ValidationError(
-                "Le paiement à rembourser est obligatoire."
-            )
-
-        if not self.reservation_id:
-            raise ValidationError(
-                "La réservation est obligatoire."
-            )
-
-        if self.payment.reservation_id != self.reservation_id:
-            raise ValidationError(
-                "Le paiement ne correspond pas à cette réservation."
-            )
-
-        if self.payment.status != Payment.Status.VALIDE:
-            raise ValidationError(
-                "Seul un paiement validé peut être remboursé."
-            )
-
-        if self.financial_account_id != self.payment.financial_account_id:
-            raise ValidationError(
-                "Le compte financier du remboursement doit "
-                "correspondre au compte du paiement."
-            )
-
-        # ----------------------------------------------------
-        # TOTAL DÉJÀ REMBOURSÉ SUR CE PAIEMENT
-        # ----------------------------------------------------
-
-        already_refunded = (
-            Refund.objects
-            .filter(
-                payment=self.payment,
-                status=Refund.Status.VALIDE,
-            )
-            .exclude(pk=self.pk)
-            .aggregate(total=Sum("amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        refundable_amount = self.payment.amount - already_refunded
-
-        if refundable_amount <= Decimal("0.00"):
-            raise ValidationError(
-                "Ce paiement a déjà été entièrement remboursé."
-            )
-
-        if self.amount > refundable_amount:
-            raise ValidationError(
-                (
-                    f"Le montant du remboursement ({self.amount} $) "
-                    f"dépasse le montant encore remboursable "
-                    f"({refundable_amount} $)."
-                )
-            )
-
-        # ----------------------------------------------------
-        # LE COMPTE DOIT AVOIR SUFFISAMMENT DE FONDS
-        # ----------------------------------------------------
-
-        if self.financial_account.balance < self.amount:
-            raise ValidationError(
-                (
-                    f"Solde insuffisant sur le compte "
-                    f"{self.financial_account.name}. "
-                    f"Solde disponible : "
-                    f"{self.financial_account.balance} $."
-                )
-            )
-
-    @property
-    def refundable_amount(self):
-        already_refunded = (
-            Refund.objects
-            .filter(
-                payment=self.payment,
-                status=Refund.Status.VALIDE,
-            )
-            .exclude(pk=self.pk)
-            .aggregate(total=Sum("amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        return max(
-            self.payment.amount - already_refunded,
-            Decimal("0.00"),
-        )
-
-    @transaction.atomic
-    def save(self, *args, **kwargs):
-
-        is_new = self.pk is None
-
-        self.full_clean()
-
-        super().save(*args, **kwargs)
-
-        # ----------------------------------------------------
-        # SORTIE FINANCIÈRE
-        # ----------------------------------------------------
-
-        if (
-            is_new
-            and self.status == self.Status.VALIDE
-        ):
-            account = FinancialAccount.objects.select_for_update().get(
-                pk=self.financial_account_id
-            )
-
-            if account.balance < self.amount:
-                raise ValidationError(
-                    "Le solde du compte est insuffisant."
-                )
-
-            account.balance -= self.amount
-
-            account.save(
-                update_fields=["balance"]
-            )
-
-            CashMovement.objects.create(
-                account=account,
-                movement_type=CashMovement.MovementType.REMBOURSEMENT,
-                amount=self.amount,
-                description=(
-                    f"Remboursement paiement #{self.payment_id} "
-                    f"de la réservation "
-                    f"{self.reservation.reservation_number}"
-                ),
-                payment=self.payment,
-                reservation=self.reservation,
-                created_by=self.created_by,
-            )
-
-            self.reservation.recalculate_financials()
 
     def __str__(self):
-        return (
-            f"Remboursement #{self.id} - "
-            f"{self.amount} $ - "
-            f"{self.reservation.reservation_number}"
-        )
+        return f"Remboursement #{self.id} - {self.amount} $"

@@ -626,31 +626,73 @@ class CashMovementSerializer(serializers.ModelSerializer):
 # ============================================================
 
 class ExpenseSerializer(serializers.ModelSerializer):
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
 
-    account_name = serializers.CharField(
-        source="financial_account.name",
-        read_only=True
+    category_display = serializers.CharField(
+        source="get_category_display",
+        read_only=True,
     )
 
     class Meta:
         model = Expense
-
         fields = [
             "id",
+            "title",
             "category",
-            "description",
+            "category_display",
             "amount",
             "expense_date",
-            "financial_account",
-            "account_name",
-            "created_by",
+            "status",
+            "status_display",
+            "notes",
             "created_at",
+            "created_by",
         ]
 
         read_only_fields = [
+            "id",
+            "created_at",
             "created_by",
         ]
 
+    def validate(self, attrs):
+        category = attrs.get(
+            "category",
+            getattr(self.instance, "category", None),
+        )
+
+        title = attrs.get(
+            "title",
+            getattr(self.instance, "title", ""),
+        )
+
+        if category == Expense.Category.AUTRE:
+            if not title or not title.strip():
+                raise serializers.ValidationError({
+                    "title": (
+                        "Le titre est obligatoire "
+                        "pour une dépense de type « Autre »."
+                    )
+                })
+
+            attrs["title"] = title.strip()
+
+        else:
+            category_labels = {
+                Expense.Category.EAU: "Eau",
+                Expense.Category.ELECTRICITE: "Électricité",
+                Expense.Category.SALAIRE: "Salaire",
+            }
+
+            attrs["title"] = category_labels.get(
+                category,
+                title,
+            )
+
+        return attrs
 
 # ============================================================
 # CONTRAT
