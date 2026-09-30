@@ -227,6 +227,10 @@ class Personnel(models.Model):
         blank=True,
         null=True,
     )
+    adresse = models.TextField(
+        blank=True,
+        null=True,
+    )
     fonction = models.CharField(
         max_length=50,
         choices=Fonction.choices,
@@ -1139,28 +1143,81 @@ class Contract(models.Model):
 # REMBOURSEMENTS
 # ============================================================
 
+
 class Refund(models.Model):
     class Status(models.TextChoices):
         EN_ATTENTE = "EN_ATTENTE", "En attente"
         VALIDE = "VALIDE", "Validé"
         ANNULE = "ANNULE", "Annulé"
 
+    payment = models.ForeignKey(
+        "Payment",
+        on_delete=models.PROTECT,
+        related_name="refunds",
+    )
+
     reservation = models.ForeignKey(
-        "Reservation", on_delete=models.CASCADE, related_name="refunds"
+        "Reservation",
+        on_delete=models.PROTECT,
+        related_name="refunds",
     )
+
     financial_account = models.ForeignKey(
-        FinancialAccount, on_delete=models.PROTECT, related_name="refunds"
+        FinancialAccount,
+        on_delete=models.PROTECT,
+        related_name="refunds",
     )
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    reason = models.TextField(blank=True)
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    method = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+    )
+
+    reason = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    reference = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+    )
+
     status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.EN_ATTENTE
+        max_length=20,
+        choices=Status.choices,
+        default=Status.EN_ATTENTE,
     )
+
     refund_date = models.DateField()
-    created_at = models.DateTimeField(auto_now_add=True)
+
+    receipt_pdf = models.FileField(
+        upload_to="refunds/receipts/",
+        blank=True,
+        null=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
     )
 
     def __str__(self):
-        return f"Remboursement #{self.id} - {self.amount} $"
+        return (
+            f"Remboursement #{self.id} - "
+            f"{self.amount} $"
+        )
+

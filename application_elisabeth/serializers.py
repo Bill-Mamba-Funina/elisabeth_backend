@@ -149,20 +149,13 @@ class HallVideoSerializer(serializers.ModelSerializer):
         return url
 
 
-class HallSerializer(serializers.ModelSerializer):
-    images = HallImageSerializer(
-        many=True,
-        read_only=True
-    )
 
-    videos = HallVideoSerializer(
-        many=True,
-        read_only=True
-    )
+class HallSerializer(serializers.ModelSerializer):
+    images = serializers.SerializerMethodField()
+    videos = serializers.SerializerMethodField()
 
     class Meta:
         model = Hall
-
         fields = [
             "id",
             "name",
@@ -172,43 +165,53 @@ class HallSerializer(serializers.ModelSerializer):
             "is_active",
             "images",
             "videos",
-            "created_at",
-            "updated_at",
         ]
 
-        read_only_fields = [
-            "id",
-            "images",
-            "videos",
-            "created_at",
-            "updated_at",
-        ]
+    def get_images(self, obj):
+        request = self.context.get("request")
 
-    def validate_name(self, value):
-        value = value.strip()
+        result = []
 
-        if not value:
-            raise serializers.ValidationError(
-                "Le nom de la salle est obligatoire."
-            )
+        for image in obj.images.all():
+            if not image.image:
+                continue
 
-        return value
+            url = image.image.url
 
-    def validate_capacity(self, value):
-        if value <= 0:
-            raise serializers.ValidationError(
-                "La capacité doit être supérieure à 0."
-            )
+            if request:
+                url = request.build_absolute_uri(url)
 
-        return value
+            result.append({
+                "id": image.id,
+                "url": url,
+                "name": image.image.name,
+            })
 
-    def validate_price(self, value):
-        if value < 0:
-            raise serializers.ValidationError(
-                "Le prix ne peut pas être négatif."
-            )
+        return result
 
-        return value
+    def get_videos(self, obj):
+        request = self.context.get("request")
+
+        result = []
+
+        for video in obj.videos.all():
+            if not video.video:
+                continue
+
+            url = video.video.url
+
+            if request:
+                url = request.build_absolute_uri(url)
+
+            result.append({
+                "id": video.id,
+                "url": url,
+                "name": video.video.name,
+            })
+
+        return result
+
+
 # ============================================================
 # MATERIEL
 # ============================================================
@@ -891,26 +894,183 @@ class ContractSerializer(serializers.ModelSerializer):
 
 
 
+
 class RefundSerializer(serializers.ModelSerializer):
-    financial_account_name = serializers.ReadOnlyField(source="financial_account.name")
+    financial_account_name = serializers.ReadOnlyField(
+        source="financial_account.name"
+    )
+
+    payment_amount = serializers.ReadOnlyField(
+        source="payment.amount"
+    )
+
+    reservation_number = serializers.ReadOnlyField(
+        source="reservation.reservation_number"
+    )
+
+    client_name = serializers.SerializerMethodField()
+
+    already_refunded = serializers.SerializerMethodField()
+
+    refundable_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = Refund
+
         fields = [
             "id",
+            "payment",
+            "payment_amount",
             "reservation",
+            "reservation_number",
+            "client_name",
             "financial_account",
             "financial_account_name",
             "amount",
+            "already_refunded",
+            "refundable_amount",
+            "method",
             "reason",
+            "reference",
             "status",
             "refund_date",
+            "receipt_pdf",
             "created_at",
             "created_by",
         ]
-        read_only_fields = ["id", "created_at", "created_by"]
 
-    def validate_amount(self, value):
-        if value <= Decimal("0.00"):
-            raise serializers.ValidationError("Le montant du remboursement doit être supérieur à 0.")
+        read_only_fields = [
+            "id",
+            "payment_amount",
+            "reservation_number",
+            "client_name",
+            "already_refunded",
+            "refundable_amount",
+            "created_at",
+            "created_by",
+        ]
+
+    def get_client_name(self, obj):
+        if not obj.reservation_id:
+            return None
+
+        client = obj.reservation.client
+
+        if not client:
+            return None
+
+        return client.full_name
+
+    def get_already_refunded(self, obj):
+        return (
+            Refund.objects
+            .filter(
+                payment=obj.payment,
+                status=Refund.Status.VALIDE,
+            )
+            .exclude(pk=obj.pk)
+            .aggregate(
+                total=Coalesce(
+                    Sum("amount"),
+                    Decimal("0.00"),
+                )
+            )["total"]
+        )
+
+    def get_refundable_amount(self, obj):
+        already_refunded = self.get_already_refunded(obj)
+
+        remaining = (
+            obj.payment.amount
+            - already_refunded
+        )
+
+        if remaining < Decimal("0.00"):
+            return Decimal("0.00")
+
+        return remaining
+
+    def validate(self, attrs):
+        payment = attrs.get("payment")
+
+        if not payment:
+            raise serializers.ValidationError({
+                "payment": (
+                    "Le paiement d'origine est obligatoire."
+                )
+            })
+
+        if payment.status != Payment.Status.VALIDE:
+            raise serializers.ValidationError({
+                "payment": (
+                    "Seul un paiement validé peut être remboursé."
+                )
+            })
+
+        reservation = attrs.get("reservation")
+
+        if reservation and reservation.pk != payment.reservation_id:
+            raise serializers.ValidationError({
+                "reservation": (
+                    "La réservation ne correspond pas "
+                    "au paiement sélectionné."
+                )
+            })
+
+        attrs["reservation"] = payment.reservation
+
+        amount = attrs.get("amount")
+
+        if amount is None:
+            raise serializers.ValidationError({
+                "amount": (
+                    "Le montant du remboursement est obligatoire."
+                )
+            })
+
+        if amount <= Decimal("0.00"):
+            raise serializers.ValidationError({
+                "amount": (
+                    "Le montant du remboursement doit "
+                    "être supérieur à 0."
+                )
+            })
+
+        already_refunded = (
+            Refund.objects
+            .filter(
+                payment=payment,
+                status=Refund.Status.VALIDE,
+            )
+            .aggregate(
+                total=Coalesce(
+                    Sum("amount"),
+                    Decimal("0.00"),
+                )
+            )["total"]
+        )
+
+        refundable_amount = (
+            payment.amount
+            - already_refunded
+        )
+
+        if amount > refundable_amount:
+            raise serializers.ValidationError({
+                "amount": (
+                    "Le montant du remboursement dépasse "
+                    f"le montant encore remboursable "
+                    f"({refundable_amount} $)."
+                )
+            })
+
+        return attrs
+
+    def validate_refund_date(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "La date du remboursement est obligatoire."
+            )
+
         return value
+

@@ -1,23 +1,25 @@
-from django.urls import include, path
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
     ClientViewSet,
     HallViewSet,
+    HallImageViewSet,
+    HallVideoViewSet,
     MaterialViewSet,
-    ReservationViewSet,
     FinancialAccountViewSet,
+    TarifViewSet,
     PaymentViewSet,
-    CashMovementViewSet,
+    ReservationViewSet,
     ExpenseViewSet,
+    CashMovementViewSet,
     ContractViewSet,
     PersonnelViewSet,
+    RefundViewSet,
     calendar_view,
     dashboard_report,
     dashboard_excel,
     dashboard_pdf,
-    TarifViewSet,
-    RefundViewSet,
 )
 
 
@@ -40,9 +42,15 @@ router.register(
 )
 
 router.register(
-    r"tarifs",
-    TarifViewSet,
-    basename="tarif",
+    r"hall-images",
+    HallImageViewSet,
+    basename="hall-image",
+)
+
+router.register(
+    r"hall-videos",
+    HallVideoViewSet,
+    basename="hall-video",
 )
 
 router.register(
@@ -52,15 +60,15 @@ router.register(
 )
 
 router.register(
-    r"reservations",
-    ReservationViewSet,
-    basename="reservation",
-)
-
-router.register(
     r"accounts",
     FinancialAccountViewSet,
     basename="financial-account",
+)
+
+router.register(
+    r"tarifs",
+    TarifViewSet,
+    basename="tarif",
 )
 
 router.register(
@@ -70,9 +78,9 @@ router.register(
 )
 
 router.register(
-    r"cash-movements",
-    CashMovementViewSet,
-    basename="cash-movement",
+    r"reservations",
+    ReservationViewSet,
+    basename="reservation",
 )
 
 router.register(
@@ -82,15 +90,15 @@ router.register(
 )
 
 router.register(
-    r"contracts",
-    ContractViewSet,
-    basename="contract",
+    r"cash-movements",
+    CashMovementViewSet,
+    basename="cash-movement",
 )
 
 router.register(
-    r"refunds",
-    RefundViewSet,
-    basename="refund",
+    r"contracts",
+    ContractViewSet,
+    basename="contract",
 )
 
 router.register(
@@ -99,21 +107,31 @@ router.register(
     basename="personnel",
 )
 
+router.register(
+    r"refunds",
+    RefundViewSet,
+    basename="refund",
+)
+
 
 # ============================================================
 # URLS
 # ============================================================
 
 urlpatterns = [
-    # CRUD principaux
+
+    # --------------------------------------------------------
+    # ROUTER PRINCIPAL
+    # --------------------------------------------------------
+
     path(
         "",
         include(router.urls),
     ),
 
-    # ========================================================
+    # --------------------------------------------------------
     # CALENDRIER
-    # ========================================================
+    # --------------------------------------------------------
 
     path(
         "calendar/<int:year>/<int:month>/",
@@ -121,9 +139,9 @@ urlpatterns = [
         name="calendar",
     ),
 
-    # ========================================================
+    # --------------------------------------------------------
     # TABLEAU DE BORD
-    # ========================================================
+    # --------------------------------------------------------
 
     path(
         "dashboard/",
@@ -131,18 +149,14 @@ urlpatterns = [
         name="dashboard",
     ),
 
-    # ========================================================
-    # EXPORTS DU TABLEAU DE BORD
-    # ========================================================
-
     path(
-        "dashboard/export/excel/",
+        "dashboard/excel/",
         dashboard_excel,
         name="dashboard-excel",
     ),
 
     path(
-        "dashboard/export/pdf/",
+        "dashboard/pdf/",
         dashboard_pdf,
         name="dashboard-pdf",
     ),

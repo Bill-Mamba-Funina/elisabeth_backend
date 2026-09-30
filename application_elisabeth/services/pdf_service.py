@@ -1,196 +1,463 @@
 from io import BytesIO
+from decimal import Decimal
 
 from django.core.files.base import ContentFile
 
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 
 def generate_payment_receipt_pdf(payment):
     """
     Génère le reçu PDF d'un paiement.
 
-    Le PDF est retourné sous forme de ContentFile
-    afin de pouvoir être enregistré directement
-    dans Payment.receipt_pdf.
+    Cette fonction :
+    1. génère le PDF en mémoire ;
+    2. enregistre le PDF dans payment.receipt_pdf ;
+    3. retourne les données binaires du PDF.
+
+    Le téléchargement HTTP est ensuite géré par PaymentViewSet.recu().
     """
 
     buffer = BytesIO()
 
-    pdf = canvas.Canvas(
+    document = SimpleDocTemplate(
         buffer,
-        pagesize=A4
+        pagesize=A4,
+        rightMargin=20 * mm,
+        leftMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
     )
 
-    width, height = A4
+    styles = getSampleStyleSheet()
 
-    # --------------------------------------------------------
-    # EN-TETE
-    # --------------------------------------------------------
+    elements = []
 
-    pdf.setFont(
-        "Helvetica-Bold",
-        18
+    # ========================================================
+    # TITRE
+    # ========================================================
+
+    elements.append(
+        Paragraph(
+            "LA CASA DA FESTA ELISABETH",
+            styles["Title"],
+        )
     )
 
-    pdf.drawCentredString(
-        width / 2,
-        height - 60,
-        "LA CASA DA FESTA ELISABETH"
+    elements.append(
+        Spacer(1, 8)
     )
 
-    pdf.setFont(
-        "Helvetica-Bold",
-        14
+    elements.append(
+        Paragraph(
+            "REÇU DE PAIEMENT",
+            styles["Heading2"],
+        )
     )
 
-    pdf.drawCentredString(
-        width / 2,
-        height - 90,
-        "REÇU DE PAIEMENT"
+    elements.append(
+        Spacer(1, 20)
     )
 
-    # --------------------------------------------------------
-    # INFORMATIONS
-    # --------------------------------------------------------
-
-    y = height - 140
-
-    pdf.setFont(
-        "Helvetica",
-        11
-    )
+    # ========================================================
+    # INFORMATIONS PAIEMENT
+    # ========================================================
 
     reservation = payment.reservation
 
-    lines = [
-        (
+    client_name = ""
+
+    if reservation and reservation.client:
+        client_name = reservation.client.full_name
+
+    reservation_number = ""
+
+    if reservation:
+        reservation_number = (
+            reservation.reservation_number or ""
+        )
+
+    amount = (
+        payment.amount
+        or Decimal("0.00")
+    )
+
+    payment_date = ""
+
+    if payment.payment_date:
+        payment_date = payment.payment_date.strftime(
+            "%d/%m/%Y %H:%M"
+        )
+
+    method = ""
+
+    if payment.method:
+        try:
+            method = payment.get_method_display()
+        except Exception:
+            method = str(payment.method)
+
+    reference = payment.reference or ""
+
+    account_name = ""
+
+    if payment.financial_account:
+        account_name = payment.financial_account.name
+
+    data = [
+        ["Informations", "Détails"],
+
+        [
             "N° paiement",
-            str(payment.id)
-        ),
-        (
+            f"#{payment.id}",
+        ],
+
+        [
             "Réservation",
-            reservation.reservation_number
-        ),
-        (
+            reservation_number,
+        ],
+
+        [
             "Client",
-            reservation.client.full_name
-        ),
-        (
-            "Salle",
-            reservation.hall.name
-        ),
-        (
-            "Événement",
-            reservation.event_type
-        ),
-        (
-            "Date événement",
-            reservation.event_date.strftime("%d/%m/%Y")
-        ),
-        (
+            client_name,
+        ],
+
+        [
             "Montant payé",
-            f"{payment.amount} $"
-        ),
-        (
+            f"{amount:,.2f} $",
+        ],
+
+        [
             "Mode de paiement",
-            payment.get_method_display()
-        ),
-        (
-            "Référence",
-            payment.reference or "-"
-        ),
-        (
+            method,
+        ],
+
+        [
+            "Compte",
+            account_name,
+        ],
+
+        [
             "Date du paiement",
-            payment.payment_date.strftime(
-                "%d/%m/%Y %H:%M"
-            )
-        ),
-        (
-            "Total réservation",
-            f"{reservation.total_amount} $"
-        ),
-        (
-            "Total payé",
-            f"{reservation.paid_amount} $"
-        ),
-        (
-            "Reste à payer",
-            f"{reservation.remaining_amount} $"
-        ),
-        (
+            payment_date,
+        ],
+
+        [
+            "Référence",
+            reference,
+        ],
+
+        [
             "Statut",
-            reservation.get_payment_status_display()
-        ),
+            "VALIDÉ",
+        ],
     ]
 
-    for label, value in lines:
-
-        pdf.setFont(
-            "Helvetica-Bold",
-            10
-        )
-
-        pdf.drawString(
-            60,
-            y,
-            f"{label} :"
-        )
-
-        pdf.setFont(
-            "Helvetica",
-            10
-        )
-
-        pdf.drawString(
-            200,
-            y,
-            str(value)
-        )
-
-        y -= 24
-
-    # --------------------------------------------------------
-    # SIGNATURE / INFORMATIONS
-    # --------------------------------------------------------
-
-    y -= 30
-
-    pdf.line(
-        60,
-        y,
-        width - 60,
-        y
+    table = Table(
+        data,
+        colWidths=[
+            55 * mm,
+            105 * mm,
+        ],
     )
 
-    y -= 30
+    table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#1e293b"),
+            ),
 
-    pdf.setFont(
-        "Helvetica",
-        9
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white,
+            ),
+
+            (
+                "FONTNAME",
+                (0, 0),
+                (-1, 0),
+                "Helvetica-Bold",
+            ),
+
+            (
+                "FONTNAME",
+                (0, 1),
+                (0, -1),
+                "Helvetica-Bold",
+            ),
+
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey,
+            ),
+
+            (
+                "VALIGN",
+                (0, 0),
+                (-1, -1),
+                "MIDDLE",
+            ),
+
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                8,
+            ),
+        ])
     )
 
-    pdf.drawString(
-        60,
-        y,
-        "Document généré automatiquement par "
-        "La Casa da Festa Elisabeth."
+    elements.append(table)
+
+    elements.append(
+        Spacer(1, 25)
     )
 
-    y -= 20
-
-    pdf.drawString(
-        60,
-        y,
-        "Merci pour votre confiance."
+    elements.append(
+        Paragraph(
+            "Merci pour votre confiance.",
+            styles["BodyText"],
+        )
     )
 
-    pdf.showPage()
-    pdf.save()
+    elements.append(
+        Spacer(1, 10)
+    )
+
+    elements.append(
+        Paragraph(
+            "La Casa da Festa Elisabeth",
+            styles["BodyText"],
+        )
+    )
+
+    # ========================================================
+    # GENERATION
+    # ========================================================
+
+    document.build(elements)
+
+    pdf_content = buffer.getvalue()
+
+    buffer.close()
+
+    # ========================================================
+    # ENREGISTREMENT DU PDF DANS PAYMENT.RECEIPT_PDF
+    # ========================================================
+
+    filename = (
+        f"recu-paiement-{payment.id}.pdf"
+    )
+
+    # On évite de recréer inutilement le même fichier.
+    payment.receipt_pdf.save(
+        filename,
+        ContentFile(pdf_content),
+        save=True,
+    )
+
+    return pdf_content
+
+
+
+def generate_refund_receipt_pdf(refund):
+    """
+    Génère le reçu PDF d'un remboursement.
+
+    Retourne un ContentFile prêt à être enregistré
+    dans Refund.receipt_pdf.
+    """
+
+    buffer = BytesIO()
+
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=20 * mm,
+        leftMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = styles["Title"]
+    normal_style = styles["Normal"]
+
+    elements = []
+
+    elements.append(
+        Paragraph(
+            "LA CASA DA FESTA ELISABETH",
+            title_style,
+        )
+    )
+
+    elements.append(
+        Spacer(1, 10)
+    )
+
+    elements.append(
+        Paragraph(
+            "REÇU DE REMBOURSEMENT",
+            styles["Heading2"],
+        )
+    )
+
+    elements.append(
+        Spacer(1, 15)
+    )
+
+    reservation = refund.reservation
+    payment = refund.payment
+
+    reservation_number = (
+        getattr(
+            reservation,
+            "reservation_number",
+            None,
+        )
+        or f"#{reservation.id}"
+    )
+
+    client = getattr(
+        reservation,
+        "client",
+        None,
+    )
+
+    client_name = "—"
+
+    if client:
+        client_name = (
+            getattr(
+                client,
+                "full_name",
+                None,
+            )
+            or str(client)
+        )
+
+    data = [
+        ["N° remboursement", f"#{refund.id}"],
+        ["N° paiement", f"#{payment.id}"],
+        ["Réservation", reservation_number],
+        ["Client", client_name],
+        [
+            "Montant remboursé",
+            f"{refund.amount} $",
+        ],
+        [
+            "Mode",
+            refund.method or payment.method or "—",
+        ],
+        [
+            "Date",
+            refund.refund_date.strftime("%d/%m/%Y"),
+        ],
+        [
+            "Statut",
+            refund.get_status_display(),
+        ],
+        [
+            "Motif",
+            refund.reason or "Non précisé",
+        ],
+    ]
+
+    table = Table(
+        data,
+        colWidths=[
+            60 * mm,
+            105 * mm,
+        ],
+    )
+
+    table.setStyle(
+        TableStyle(
+            [
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.grey,
+                ),
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (0, -1),
+                    colors.whitesmoke,
+                ),
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (0, -1),
+                    "Helvetica-Bold",
+                ),
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "TOP",
+                ),
+                (
+                    "PADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+            ]
+        )
+    )
+
+    elements.append(table)
+
+    elements.append(
+        Spacer(1, 25)
+    )
+
+    elements.append(
+        Paragraph(
+            "Ce document constitue le reçu du remboursement enregistré dans le système.",
+            normal_style,
+        )
+    )
+
+    elements.append(
+        Spacer(1, 30)
+    )
+
+    elements.append(
+        Paragraph(
+            "La Casa da Festa Elisabeth",
+            normal_style,
+        )
+    )
+
+    document.build(elements)
 
     buffer.seek(0)
 
     return ContentFile(
-        buffer.getvalue(),
-        name=f"recu-paiement-{payment.id}.pdf"
+        buffer.read(),
+        name=f"recu_remboursement_{refund.id}.pdf",
     )

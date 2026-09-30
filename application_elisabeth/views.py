@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.http import JsonResponse, HttpResponse, FileResponse
 from django.db import transaction
 from django.db.models import Sum
 from django.db.models.functions import TruncMonth
@@ -307,6 +308,7 @@ class TarifViewSet(viewsets.ModelViewSet):
 # PAIEMENTS
 # ============================================================
 
+
 class PaymentViewSet(viewsets.ModelViewSet):
 
     queryset = (
@@ -322,7 +324,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = PaymentSerializer
-
     permission_classes = [IsAuthenticated]
 
     # ========================================================
@@ -367,12 +368,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
         # ----------------------------------------------------
         # VERROUILLAGE DE LA RESERVATION
         # ----------------------------------------------------
-        #
-        # Très important :
-        #
-        # Deux requêtes simultanées ne peuvent pas calculer
-        # le même reste à payer et créer deux paiements.
-        #
 
         locked_reservation = None
 
@@ -382,17 +377,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 Reservation.objects
                 .select_for_update()
                 .select_related("tarif")
-                .get(pk=reservation.pk)
+                .get(
+                    pk=reservation.pk
+                )
             )
 
             # ------------------------------------------------
-            # RESTE A PAYER ACTUEL
+            # TOTAL RESERVATION
             # ------------------------------------------------
 
             total = (
                 locked_reservation.total_amount
                 or Decimal("0.00")
             )
+
+            # ------------------------------------------------
+            # TOTAL DEJA PAYE
+            # ------------------------------------------------
 
             already_paid = (
                 Payment.objects
@@ -407,9 +408,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 or Decimal("0.00")
             )
 
+            # ------------------------------------------------
+            # TOTAL REMBOURSE
+            # ------------------------------------------------
+
             refunded = (
                 locked_reservation.refunded_amount
+                or Decimal("0.00")
             )
+
+            # ------------------------------------------------
+            # RESTE A PAYER
+            # ------------------------------------------------
 
             remaining = (
                 total
@@ -420,7 +430,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             if remaining < Decimal("0.00"):
                 remaining = Decimal("0.00")
 
-            amount = validated_data.get("amount")
+            amount = (
+                validated_data.get("amount")
+                or Decimal("0.00")
+            )
 
             status_value = validated_data.get(
                 "status",
@@ -428,7 +441,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
             # ------------------------------------------------
-            # PAIEMENT ANNULE
+            # PAIEMENT ANNULE INTERDIT A LA CREATION
             # ------------------------------------------------
 
             if status_value == Payment.Status.ANNULE:
@@ -462,19 +475,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                 raise serializers.ValidationError({
                     "amount": (
-                        f"Le montant maximum autorisé est "
+                        "Le montant maximum autorisé est "
                         f"{remaining} $."
                     )
                 })
 
-            # On remplace l'objet reservation du serializer
-            # par l'objet verrouillé.
+            # ------------------------------------------------
+            # UTILISER LA RESERVATION VERROUILLEE
+            # ------------------------------------------------
+
             validated_data["reservation"] = (
                 locked_reservation
             )
 
         # ----------------------------------------------------
-        # REFERENCE UNIQUE SI FOURNIE
+        # REFERENCE UNIQUE
         # ----------------------------------------------------
 
         reference = validated_data.get("reference")
@@ -484,7 +499,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
             existing_reference = (
                 Payment.objects
                 .select_for_update()
-                .filter(reference=reference)
+                .filter(
+                    reference=reference
+                )
                 .first()
             )
 
@@ -499,7 +516,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 })
 
         # ----------------------------------------------------
-        # CREATION UNIQUE
+        # CREATION DU PAIEMENT
         # ----------------------------------------------------
 
         serializer.save(
@@ -507,7 +524,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
 
     # ========================================================
-    # VALIDER
+    # VALIDER UN PAIEMENT
     # ========================================================
 
     @action(
@@ -588,7 +605,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
             # ------------------------------------------------
-            # CALCUL DU RESTE
+            # TOTAL RESERVATION
             # ------------------------------------------------
 
             total = (
@@ -596,13 +613,19 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 or Decimal("0.00")
             )
 
+            # ------------------------------------------------
+            # AUTRES PAIEMENTS DEJA VALIDES
+            # ------------------------------------------------
+
             other_paid = (
                 Payment.objects
                 .filter(
                     reservation=reservation,
                     status=Payment.Status.VALIDE,
                 )
-                .exclude(pk=payment.pk)
+                .exclude(
+                    pk=payment.pk
+                )
                 .aggregate(
                     total=Sum("amount")
                 )
@@ -610,9 +633,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 or Decimal("0.00")
             )
 
+            # ------------------------------------------------
+            # REMBOURSEMENTS
+            # ------------------------------------------------
+
             refunded = (
                 reservation.refunded_amount
+                or Decimal("0.00")
             )
+
+            # ------------------------------------------------
+            # RESTE DISPONIBLE
+            # ------------------------------------------------
 
             remaining = (
                 total
@@ -624,7 +656,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 remaining = Decimal("0.00")
 
             # ------------------------------------------------
-            # PAIEMENT DEJA COUVERT
+            # RESERVATION DEJA PAYEE
             # ------------------------------------------------
 
             if remaining <= Decimal("0.00"):
@@ -658,24 +690,26 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
 
         # ====================================================
-        # VALIDATION DU PAIEMENT
+        # VALIDATION
         # ====================================================
 
         payment.status = Payment.Status.VALIDE
 
         payment.save(
-            update_fields=["status"]
+            update_fields=[
+                "status",
+            ]
         )
 
         # ====================================================
-        # MOUVEMENT FINANCIER UNIQUE
+        # MOUVEMENT FINANCIER
         # ====================================================
 
         if payment.financial_account:
 
-            # -----------------------------------------------
-            # VERROUILLAGE DU COMPTE
-            # -----------------------------------------------
+            # ------------------------------------------------
+            # VERROUILLER LE COMPTE
+            # ------------------------------------------------
 
             account = (
                 FinancialAccount.objects
@@ -685,9 +719,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
             )
 
-            # -----------------------------------------------
-            # VERIFICATION EXISTENCE MOUVEMENT
-            # -----------------------------------------------
+            # ------------------------------------------------
+            # VERIFIER SI LE MOUVEMENT EXISTE
+            # ------------------------------------------------
 
             mouvement_existe = (
                 CashMovement.objects
@@ -700,16 +734,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 .exists()
             )
 
-            # -----------------------------------------------
-            # CREATION UNIQUE
-            # -----------------------------------------------
+            # ------------------------------------------------
+            # CREER LE MOUVEMENT UNE SEULE FOIS
+            # ------------------------------------------------
 
             if not mouvement_existe:
 
                 account.balance += payment.amount
 
                 account.save(
-                    update_fields=["balance"]
+                    update_fields=[
+                        "balance",
+                    ]
                 )
 
                 CashMovement.objects.create(
@@ -728,7 +764,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
 
         # ====================================================
-        # MISE A JOUR RESERVATION
+        # RECALCUL FINANCIER RESERVATION
         # ====================================================
 
         if reservation:
@@ -736,7 +772,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             reservation.recalculate_financials()
 
         # ====================================================
-        # RECU PDF
+        # GENERATION DU RECU PDF
         # ====================================================
 
         try:
@@ -748,7 +784,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as exc:
 
             print(
-                "Erreur génération reçu PDF :",
+                "ERREUR GENERATION RECU PDF :",
                 exc,
             )
 
@@ -767,7 +803,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
 
     # ========================================================
-    # ANNULER
+    # ANNULER UN PAIEMENT
     # ========================================================
 
     @action(
@@ -784,6 +820,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             .get(pk=pk)
         )
 
+        # ----------------------------------------------------
+        # DEJA VALIDE
+        # ----------------------------------------------------
+
         if payment.status == Payment.Status.VALIDE:
 
             return Response(
@@ -798,6 +838,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ----------------------------------------------------
+        # DEJA ANNULE
+        # ----------------------------------------------------
+
         if payment.status == Payment.Status.ANNULE:
 
             return Response(
@@ -809,10 +853,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ----------------------------------------------------
+        # ANNULATION
+        # ----------------------------------------------------
+
         payment.status = Payment.Status.ANNULE
 
         payment.save(
-            update_fields=["status"]
+            update_fields=[
+                "status",
+            ]
         )
 
         return Response(
@@ -821,11 +871,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 context={
                     "request": request,
                 },
-            ).data
+            ).data,
+            status=status.HTTP_200_OK,
         )
 
     # ========================================================
-    # RECU PDF
+    # AFFICHER / TELECHARGER LE RECU PDF
     # ========================================================
 
     @action(
@@ -835,7 +886,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
     )
     def recu(self, request, pk=None):
 
-        payment = self.get_object()
+        # ----------------------------------------------------
+        # RECUPERER LE PAIEMENT
+        # ----------------------------------------------------
+
+        payment = (
+            Payment.objects
+            .select_related(
+                "reservation",
+                "reservation__client",
+                "financial_account",
+            )
+            .get(pk=pk)
+        )
+
+        # ----------------------------------------------------
+        # VERIFICATION DU STATUT
+        # ----------------------------------------------------
 
         if payment.status != Payment.Status.VALIDE:
 
@@ -849,12 +916,70 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        pdf = generate_payment_receipt_pdf(
-            payment
+        # ----------------------------------------------------
+        # GENERER LE PDF
+        # ----------------------------------------------------
+
+        try:
+
+            pdf_content = (
+                generate_payment_receipt_pdf(
+                    payment
+                )
+            )
+
+        except Exception as exc:
+
+            print(
+                "ERREUR GENERATION RECU PDF :",
+                exc,
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Impossible de générer "
+                        "le reçu PDF."
+                    ),
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # ----------------------------------------------------
+        # REPONSE HTTP PDF
+        # ----------------------------------------------------
+
+        response = HttpResponse(
+            pdf_content,
+            content_type="application/pdf",
         )
 
-        return pdf
+        # ----------------------------------------------------
+        # INLINE :
+        # LE NAVIGATEUR PEUT AFFICHER LE PDF
+        # ----------------------------------------------------
 
+        response[
+            "Content-Disposition"
+        ] = (
+            f'inline; filename="recu-paiement-'
+            f'{payment.id}.pdf"'
+        )
+
+        response[
+            "Content-Length"
+        ] = str(
+            len(pdf_content)
+        )
+
+        return response
+
+
+
+# ============================================================
+# RESERVATIONS
+# ============================================================
 
 # ============================================================
 # RESERVATIONS
@@ -877,12 +1002,11 @@ class ReservationViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = ReservationSerializer
-
     permission_classes = [IsAuthenticated]
 
-    # --------------------------------------------------------
+    # ========================================================
     # CREATION
-    # --------------------------------------------------------
+    # ========================================================
 
     def perform_create(self, serializer):
 
@@ -890,27 +1014,38 @@ class ReservationViewSet(viewsets.ModelViewSet):
             created_by=self.request.user
         )
 
-        Notification.objects.create(
-            user=self.request.user,
-
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CREATED
-            ),
-
-            title="Nouvelle réservation",
-
-            message=(
-                f"La réservation "
-                f"{reservation.reservation_number} "
-                f"a été créée."
-            ),
-
-            reservation=reservation,
+        client_name = (
+            reservation.client.full_name
+            if reservation.client
+            else "Non renseigné"
         )
 
-    # --------------------------------------------------------
+        hall_name = (
+            reservation.hall.name
+            if reservation.hall
+            else "Non renseignée"
+        )
+
+        send_notification(
+            subject="Nouvelle réservation",
+            message=(
+                "Une nouvelle réservation a été créée.\n\n"
+                f"Numéro : {reservation.reservation_number}\n"
+                f"Client : {client_name}\n"
+                f"Salle : {hall_name}\n"
+                f"Événement : "
+                f"{reservation.event_type or 'Non renseigné'}\n"
+                f"Date : {reservation.event_date}\n"
+                f"Statut : "
+                f"{reservation.get_status_display()}\n"
+                f"Montant : "
+                f"{reservation.total_amount or Decimal('0.00')} $"
+            ),
+        )
+
+    # ========================================================
     # MODIFICATION
-    # --------------------------------------------------------
+    # ========================================================
 
     def perform_update(self, serializer):
 
@@ -918,33 +1053,43 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
         reservation = serializer.save()
 
+        # ----------------------------------------------------
+        # RESERVATION CONFIRMEE
+        # ----------------------------------------------------
+
         if (
             old_status != Reservation.Status.CONFIRMEE
             and reservation.status
             == Reservation.Status.CONFIRMEE
         ):
 
-            Notification.objects.create(
-                user=self.request.user,
+            client_name = (
+                reservation.client.full_name
+                if reservation.client
+                else "Non renseigné"
+            )
 
-                notification_type=(
-                    Notification.NotificationType.RESERVATION_CONFIRMED
-                ),
+            hall_name = (
+                reservation.hall.name
+                if reservation.hall
+                else "Non renseignée"
+            )
 
-                title="Réservation confirmée",
-
+            send_notification(
+                subject="Réservation confirmée",
                 message=(
                     f"La réservation "
                     f"{reservation.reservation_number} "
-                    f"a été confirmée."
+                    f"a été confirmée.\n\n"
+                    f"Client : {client_name}\n"
+                    f"Salle : {hall_name}\n"
+                    f"Date : {reservation.event_date}"
                 ),
-
-                reservation=reservation,
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CONFIRMER
-    # --------------------------------------------------------
+    # ========================================================
 
     @action(
         detail=True,
@@ -973,22 +1118,28 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
         reservation.save()
 
-        Notification.objects.create(
-            user=request.user,
+        client_name = (
+            reservation.client.full_name
+            if reservation.client
+            else "Non renseigné"
+        )
 
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CONFIRMED
-            ),
+        hall_name = (
+            reservation.hall.name
+            if reservation.hall
+            else "Non renseignée"
+        )
 
-            title="Réservation confirmée",
-
+        send_notification(
+            subject="Réservation confirmée",
             message=(
                 f"La réservation "
                 f"{reservation.reservation_number} "
-                f"est maintenant confirmée."
+                f"est maintenant confirmée.\n\n"
+                f"Client : {client_name}\n"
+                f"Salle : {hall_name}\n"
+                f"Date : {reservation.event_date}"
             ),
-
-            reservation=reservation,
         )
 
         return Response(
@@ -997,12 +1148,13 @@ class ReservationViewSet(viewsets.ModelViewSet):
                 context={
                     "request": request,
                 },
-            ).data
+            ).data,
+            status=status.HTTP_200_OK,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ANNULER
-    # --------------------------------------------------------
+    # ========================================================
 
     @action(
         detail=True,
@@ -1013,26 +1165,45 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
         reservation = self.get_object()
 
+        if (
+            reservation.status
+            == Reservation.Status.ANNULEE
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Cette réservation est déjà annulée."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         reservation.status = Reservation.Status.ANNULEE
 
         reservation.save()
 
-        Notification.objects.create(
-            user=request.user,
+        client_name = (
+            reservation.client.full_name
+            if reservation.client
+            else "Non renseigné"
+        )
 
-            notification_type=(
-                Notification.NotificationType.RESERVATION_CANCELLED
-            ),
+        hall_name = (
+            reservation.hall.name
+            if reservation.hall
+            else "Non renseignée"
+        )
 
-            title="Réservation annulée",
-
+        send_notification(
+            subject="Réservation annulée",
             message=(
                 f"La réservation "
                 f"{reservation.reservation_number} "
-                f"a été annulée."
+                f"a été annulée.\n\n"
+                f"Client : {client_name}\n"
+                f"Salle : {hall_name}\n"
+                f"Date : {reservation.event_date}"
             ),
-
-            reservation=reservation,
         )
 
         return Response(
@@ -1041,9 +1212,9 @@ class ReservationViewSet(viewsets.ModelViewSet):
                 context={
                     "request": request,
                 },
-            ).data
+            ).data,
+            status=status.HTTP_200_OK,
         )
-
 
 
 
@@ -2567,64 +2738,253 @@ def dashboard_pdf(request):
 
 
 
+
 class RefundViewSet(viewsets.ModelViewSet):
-    queryset = Refund.objects.select_related("reservation", "financial_account", "created_by").all()
+    queryset = (
+        Refund.objects
+        .select_related(
+            "payment",
+            "reservation",
+            "reservation__client",
+            "financial_account",
+            "created_by",
+        )
+        .all()
+        .order_by("-created_at")
+    )
+
     serializer_class = RefundSerializer
     permission_classes = [IsAuthenticated]
 
     @transaction.atomic
     def perform_create(self, serializer):
-        refund = serializer.save(created_by=self.request.user)
-        if refund.status == Refund.Status.VALIDE:
-            self._process_refund_payout(refund, self.request.user)
+        refund = serializer.save(
+            created_by=self.request.user
+        )
 
-    @action(detail=True, methods=["post"], url_path="valider")
+        return refund
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="valider",
+    )
     @transaction.atomic
     def valider(self, request, pk=None):
-        refund = Refund.objects.select_for_update().get(pk=pk)
+        refund = (
+            Refund.objects
+            .select_for_update()
+            .select_related(
+                "payment",
+                "reservation",
+                "financial_account",
+            )
+            .get(pk=pk)
+        )
 
         if refund.status == Refund.Status.VALIDE:
             return Response(
-                {"detail": "Ce remboursement est déjà validé."},
+                {
+                    "detail": (
+                        "Ce remboursement est déjà validé."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        self._process_refund_payout(refund, request.user)
+        if refund.status == Refund.Status.ANNULE:
+            return Response(
+                {
+                    "detail": (
+                        "Ce remboursement a été annulé."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        self._process_refund_payout(
+            refund,
+            request.user,
+        )
 
         refund.status = Refund.Status.VALIDE
-        refund.save(update_fields=["status"])
 
-        # Recalculer le bilan financier de la réservation
+        refund.save(
+            update_fields=[
+                "status",
+            ]
+        )
+
         if refund.reservation:
             refund.reservation.recalculate_financials()
 
-        return Response(RefundSerializer(refund, context={"request": request}).data)
+        self._generate_receipt(refund)
 
-    def _process_refund_payout(self, refund, user):
-        account = FinancialAccount.objects.select_for_update().get(pk=refund.financial_account_id)
+        return Response(
+            RefundSerializer(
+                refund,
+                context={
+                    "request": request,
+                },
+            ).data
+        )
+
+    def _process_refund_payout(
+        self,
+        refund,
+        user,
+    ):
+        payment = (
+            Payment.objects
+            .select_for_update()
+            .get(pk=refund.payment_id)
+        )
+
+        account = (
+            FinancialAccount.objects
+            .select_for_update()
+            .get(
+                pk=refund.financial_account_id
+            )
+        )
+
+        if payment.status != Payment.Status.VALIDE:
+            raise serializers.ValidationError(
+                {
+                    "detail": (
+                        "Le paiement doit être validé "
+                        "avant de pouvoir être remboursé."
+                    )
+                }
+            )
+
+        already_refunded = (
+            Refund.objects
+            .filter(
+                payment=payment,
+                status=Refund.Status.VALIDE,
+            )
+            .exclude(pk=refund.pk)
+            .aggregate(
+                total=Sum("amount")
+            )["total"]
+            or Decimal("0.00")
+        )
+
+        refundable_amount = (
+            payment.amount - already_refunded
+        )
+
+        if refund.amount > refundable_amount:
+            raise serializers.ValidationError(
+                {
+                    "amount": (
+                        "Le montant du remboursement dépasse "
+                        "le montant encore remboursable."
+                    )
+                }
+            )
 
         if account.balance < refund.amount:
-            raise serializers.ValidationError({
-                "detail": f"Solde insuffisant dans la caisse '{account.name}' pour effectuer ce remboursement. Solde actuel : {account.balance} $."
-            })
-
-        movement_exists = CashMovement.objects.filter(
-            refund=refund,
-            movement_type=CashMovement.MovementType.SORTIE,
-        ).exists()
-
-        if not movement_exists:
-            # 1. Diminuer le solde de la caisse
-            account.balance -= refund.amount
-            account.save(update_fields=["balance"])
-
-            # 2. Créer la sortie de caisse
-            CashMovement.objects.create(
-                account=account,
-                refund=refund,
-                reservation=refund.reservation,
-                movement_type=CashMovement.MovementType.SORTIE,
-                amount=refund.amount,
-                description=f"Sortie Remboursement #{refund.id} - Réservation #{refund.reservation_id}",
-                created_by=user,
+            raise serializers.ValidationError(
+                {
+                    "detail": (
+                        f"Solde insuffisant dans la caisse "
+                        f"'{account.name}' pour effectuer "
+                        f"ce remboursement. "
+                        f"Solde actuel : {account.balance} $."
+                    )
+                }
             )
+
+        movement_exists = (
+            CashMovement.objects.filter(
+                refund=refund,
+                movement_type=CashMovement.MovementType.SORTIE,
+            ).exists()
+        )
+
+        if movement_exists:
+            return
+
+        account.balance -= refund.amount
+
+        account.save(
+            update_fields=[
+                "balance",
+            ]
+        )
+
+        CashMovement.objects.create(
+            account=account,
+            refund=refund,
+            reservation=refund.reservation,
+            movement_type=CashMovement.MovementType.SORTIE,
+            amount=refund.amount,
+            description=(
+                f"Sortie Remboursement #{refund.id} "
+                f"- Paiement #{payment.id} "
+                f"- Réservation "
+                f"#{refund.reservation_id}"
+            ),
+            created_by=user,
+        )
+
+    def _generate_receipt(self, refund):
+        from .services.pdf_service import (
+            generate_refund_receipt_pdf,
+        )
+
+        pdf_file = generate_refund_receipt_pdf(
+            refund
+        )
+
+        refund.receipt_pdf.save(
+            pdf_file.name,
+            pdf_file,
+            save=True,
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="recu",
+    )
+    def recu(self, request, pk=None):
+        refund = (
+            Refund.objects
+            .select_related(
+                "payment",
+                "reservation",
+                "financial_account",
+            )
+            .get(pk=pk)
+        )
+
+        if not refund.receipt_pdf:
+            if refund.status != Refund.Status.VALIDE:
+                return Response(
+                    {
+                        "detail": (
+                            "Le reçu PDF sera disponible "
+                            "après validation du remboursement."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            self._generate_receipt(refund)
+
+            refund.refresh_from_db()
+
+        response = FileResponse(
+            refund.receipt_pdf.open("rb"),
+            content_type="application/pdf",
+        )
+
+        response["Content-Disposition"] = (
+            f'inline; filename="'
+            f'recu_remboursement_{refund.id}.pdf"'
+        )
+
+        return response
