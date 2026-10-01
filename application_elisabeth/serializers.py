@@ -1,7 +1,13 @@
 ﻿from decimal import Decimal
 
 from django.db.models import Count, Sum
+from django.db.models.functions import Coalesce
 from rest_framework import serializers
+
+
+
+from .utils import normalize_phone
+
 
 from django.db import transaction
 
@@ -27,9 +33,12 @@ from .models import (
 # ============================================================
 
 class ClientSerializer(serializers.ModelSerializer):
+
     reservations_count = serializers.IntegerField(
         read_only=True
     )
+
+    reservations_history = serializers.SerializerMethodField()
 
     class Meta:
         model = Client
@@ -42,6 +51,7 @@ class ClientSerializer(serializers.ModelSerializer):
             "address",
             "notes",
             "reservations_count",
+            "reservations_history",
             "created_at",
             "updated_at",
         ]
@@ -49,39 +59,100 @@ class ClientSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "reservations_count",
+            "reservations_history",
             "created_at",
             "updated_at",
         ]
 
-    def validate_phone(self, value):
-        value = (
-            value.strip()
-            .replace(" ", "")
-            .replace("-", "")
-            .replace("(", "")
-            .replace(")", "")
+    def get_reservations_history(self, obj):
+
+        reservations = (
+            obj.reservations
+            .select_related("hall", "tarif")
+            .prefetch_related("payments", "refunds")
+            .all()
         )
 
-        if not value:
-            raise serializers.ValidationError(
-                "Le numéro de téléphone est obligatoire."
-            )
+        return [
+            {
+                "id": reservation.id,
+                "reservation_number": (
+                    reservation.reservation_number
+                ),
+                "event_type": reservation.event_type,
+                "event_date": reservation.event_date,
+                "start_time": reservation.start_time,
+                "end_time": reservation.end_time,
+                "hall": (
+                    reservation.hall.name
+                    if reservation.hall
+                    else None
+                ),
+                "status": reservation.status,
+                "payment_status": (
+                    reservation.payment_status
+                ),
+                "total_amount": (
+                    reservation.total_amount
+                ),
+                "paid_amount": (
+                    reservation.paid_amount
+                ),
+                "remaining_amount": (
+                    reservation.remaining_amount
+                ),
+                "payments": [
+                    {
+                        "id": payment.id,
+                        "amount": payment.amount,
+                        "payment_date": payment.payment_date,
+                        "method": payment.method,
+                        "status": payment.status,
+                        "reference": payment.reference,
+                    }
+                    for payment in reservation.payments.all()
+                ],
+                "refunds": [
+                    {
+                        "id": refund.id,
+                        "amount": refund.amount,
+                        "refund_date": refund.refund_date,
+                        "method": refund.method,
+                        "status": refund.status,
+                        "reason": refund.reason,
+                        "reference": refund.reference,
+                    }
+                    for refund in reservation.refunds.all()
+                ],
+                "created_at": reservation.created_at,
+            }
+            for reservation in reservations
+        ]
 
-        queryset = Client.objects.filter(
-            phone=value
-        )
 
-        if self.instance:
-            queryset = queryset.exclude(
-                pk=self.instance.pk
-            )
 
-        if queryset.exists():
-            raise serializers.ValidationError(
-                "Un client existe déjà avec ce numéro de téléphone."
-            )
 
-        return value
+class ClientHistorySerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Reservation
+
+        fields = [
+            "id",
+            "reservation_number",
+            "event_type",
+            "event_date",
+            "start_time",
+            "end_time",
+            "status",
+            "payment_status",
+            "total_amount",
+            "paid_amount",
+            "remaining_amount",
+            "created_at",
+        ]
+
+
 
 # ============================================================
 # HALL
@@ -273,156 +344,188 @@ class PersonnelSerializer(serializers.ModelSerializer):
 
 
 
+
 class ReservationSerializer(serializers.ModelSerializer):
-    # ---------------------------------------------------------
+
+    # =========================================================
     # INFORMATIONS CLIENT ENTRANTES
-    # ---------------------------------------------------------
+    # =========================================================
 
     client_full_name = serializers.CharField(
         write_only=True,
-        required=True
+        required=True,
     )
 
     client_phone = serializers.CharField(
         write_only=True,
-        required=True
+        required=True,
     )
 
     client_email = serializers.EmailField(
         write_only=True,
         required=False,
         allow_blank=True,
-        allow_null=True
+        allow_null=True,
     )
 
     client_address = serializers.CharField(
         write_only=True,
         required=False,
         allow_blank=True,
-        allow_null=True
+        allow_null=True,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # INFORMATIONS CLIENT SORTANTES
-    # ---------------------------------------------------------
+    # =========================================================
 
     client_name = serializers.CharField(
         source="client.full_name",
-        read_only=True
+        read_only=True,
     )
 
-    client_phone_display = serializers.CharField(
-        source="client.phone",
-        read_only=True
+    client_phone_display = serializers.SerializerMethodField(
+        read_only=True,
     )
 
-    # ---------------------------------------------------------
-    # INFORMATIONS SALLE
-    # ---------------------------------------------------------
+    client_email_display = serializers.SerializerMethodField(
+        read_only=True,
+    )
+
+    client_address_display = serializers.SerializerMethodField(
+        read_only=True,
+    )
+
+    # =========================================================
+    # SALLE
+    # =========================================================
 
     hall_name = serializers.CharField(
         source="hall.name",
-        read_only=True
+        read_only=True,
     )
 
-    # ---------------------------------------------------------
-    # INFORMATIONS TARIF
-    # ---------------------------------------------------------
+    # =========================================================
+    # TARIF
+    # =========================================================
 
     tarif_name = serializers.CharField(
         source="tarif.name",
-        read_only=True
+        read_only=True,
     )
 
     tarif_amount = serializers.DecimalField(
         source="tarif.amount",
         max_digits=12,
         decimal_places=2,
-        read_only=True
+        read_only=True,
     )
 
-    # ---------------------------------------------------------
-    # MONTANTS
-    # ---------------------------------------------------------
+    # =========================================================
+    # FINANCES
+    # =========================================================
 
     total_amount = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        read_only=True
+        read_only=True,
     )
 
     paid_amount = serializers.DecimalField(
+        source="net_paid_amount",
         max_digits=12,
         decimal_places=2,
-        read_only=True
+        read_only=True,
     )
 
     remaining_amount = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        read_only=True
+        read_only=True,
     )
 
-    # ---------------------------------------------------------
-    # PAIEMENT
-    # ---------------------------------------------------------
+    # =========================================================
+    # STATUTS
+    # =========================================================
 
     payment_status_display = serializers.CharField(
         source="get_payment_status_display",
-        read_only=True
+        read_only=True,
     )
 
     status_display = serializers.CharField(
         source="get_status_display",
-        read_only=True
+        read_only=True,
     )
+
+    # =========================================================
+    # META
+    # =========================================================
 
     class Meta:
         model = Reservation
 
         fields = [
             "id",
-
-            # Identification
             "reservation_number",
 
-            # Client
+            # -------------------------------------------------
+            # CLIENT
+            # -------------------------------------------------
             "client",
             "client_name",
             "client_phone_display",
+            "client_email_display",
+            "client_address_display",
+
+            # -------------------------------------------------
+            # INFORMATIONS CLIENT ENTRANTES
+            # -------------------------------------------------
             "client_full_name",
             "client_phone",
             "client_email",
             "client_address",
 
-            # Salle
+            # -------------------------------------------------
+            # SALLE
+            # -------------------------------------------------
             "hall",
             "hall_name",
 
-            # Tarif
+            # -------------------------------------------------
+            # TARIF
+            # -------------------------------------------------
             "tarif",
             "tarif_name",
             "tarif_amount",
 
-            # Événement
+            # -------------------------------------------------
+            # ÉVÉNEMENT
+            # -------------------------------------------------
             "event_type",
             "event_date",
             "start_time",
             "end_time",
             "guest_count",
 
-            # Statuts
+            # -------------------------------------------------
+            # STATUTS
+            # -------------------------------------------------
             "status",
             "status_display",
             "payment_status",
             "payment_status_display",
 
-            # Finances
+            # -------------------------------------------------
+            # FINANCES
+            # -------------------------------------------------
             "total_amount",
             "paid_amount",
             "remaining_amount",
 
-            # Dates
+            # -------------------------------------------------
+            # DATES
+            # -------------------------------------------------
             "created_at",
             "updated_at",
         ]
@@ -441,14 +544,78 @@ class ReservationSerializer(serializers.ModelSerializer):
         ]
 
     # =========================================================
-    # VALIDATION
+    # CLIENT - INFORMATIONS SORTANTES
+    # =========================================================
+
+    def get_client_phone_display(self, obj):
+        """
+        Retourne le téléphone réel enregistré dans Client.
+        """
+
+        if not obj.client:
+            return ""
+
+        return str(
+            obj.client.phone or ""
+        ).strip()
+
+    def get_client_email_display(self, obj):
+        """
+        Retourne l'email réel enregistré dans Client.
+        """
+
+        if not obj.client:
+            return ""
+
+        return str(
+            obj.client.email or ""
+        ).strip()
+
+    def get_client_address_display(self, obj):
+        """
+        Retourne l'adresse réelle enregistrée dans Client.
+        """
+
+        if not obj.client:
+            return ""
+
+        return str(
+            obj.client.address or ""
+        ).strip()
+
+    # =========================================================
+    # NORMALISATION TELEPHONE
+    # =========================================================
+
+    def validate_client_phone(self, value):
+
+        value = normalize_phone(value)
+
+        if not value:
+            raise serializers.ValidationError(
+                "Le numéro de téléphone est obligatoire."
+            )
+
+        return value
+
+    # =========================================================
+    # VALIDATION RESERVATION
     # =========================================================
 
     def validate(self, attrs):
+
         start_time = attrs.get("start_time")
         end_time = attrs.get("end_time")
 
-        if start_time and end_time and start_time >= end_time:
+        # -----------------------------------------------------
+        # Vérification des heures
+        # -----------------------------------------------------
+
+        if (
+            start_time
+            and end_time
+            and start_time >= end_time
+        ):
             raise serializers.ValidationError({
                 "end_time": (
                     "L'heure de fin doit être supérieure "
@@ -459,9 +626,22 @@ class ReservationSerializer(serializers.ModelSerializer):
         hall = attrs.get("hall")
         event_date = attrs.get("event_date")
 
-        if hall and event_date and start_time and end_time:
+        # -----------------------------------------------------
+        # Vérification chevauchement salle
+        # -----------------------------------------------------
 
-            reservation_id = self.instance.pk if self.instance else None
+        if (
+            hall
+            and event_date
+            and start_time
+            and end_time
+        ):
+
+            reservation_id = (
+                self.instance.pk
+                if self.instance
+                else None
+            )
 
             conflicts = Reservation.objects.filter(
                 hall=hall,
@@ -506,36 +686,64 @@ class ReservationSerializer(serializers.ModelSerializer):
             "client_full_name"
         ).strip()
 
-        phone = validated_data.pop(
-            "client_phone"
-        ).strip()
+        phone = normalize_phone(
+            validated_data.pop("client_phone")
+        )
+
+        if not phone:
+            raise serializers.ValidationError({
+                "client_phone": (
+                    "Le numéro de téléphone est obligatoire."
+                )
+            })
 
         email = validated_data.pop(
             "client_email",
-            None
+            None,
         )
 
         address = validated_data.pop(
             "client_address",
-            None
+            None,
         )
 
-        if email:
+        # -----------------------------------------------------
+        # Nettoyage email
+        # -----------------------------------------------------
+
+        if email is not None:
             email = email.strip()
 
-        if address:
+            if not email:
+                email = None
+
+        # -----------------------------------------------------
+        # Nettoyage adresse
+        # -----------------------------------------------------
+
+        if address is not None:
             address = address.strip()
 
-        # -----------------------------------------------------
-        # Recherche du client par téléphone
-        # -----------------------------------------------------
+            if not address:
+                address = None
 
-        client = Client.objects.filter(
-            phone=phone
-        ).first()
+        # =====================================================
+        # RECHERCHE CLIENT PAR TELEPHONE
+        # =====================================================
+
+        client = (
+            Client.objects
+            .select_for_update()
+            .filter(phone=phone)
+            .first()
+        )
+
+        # =====================================================
+        # CLIENT EXISTANT
+        # =====================================================
 
         if client:
-            # Mise à jour des informations existantes
+
             client.full_name = full_name
 
             if email is not None:
@@ -544,10 +752,21 @@ class ReservationSerializer(serializers.ModelSerializer):
             if address is not None:
                 client.address = address
 
-            client.save()
+            client.save(
+                update_fields=[
+                    "full_name",
+                    "email",
+                    "address",
+                    "updated_at",
+                ]
+            )
+
+        # =====================================================
+        # NOUVEAU CLIENT
+        # =====================================================
 
         else:
-            # Création automatique du client
+
             client = Client.objects.create(
                 full_name=full_name,
                 phone=phone,
@@ -555,19 +774,19 @@ class ReservationSerializer(serializers.ModelSerializer):
                 address=address,
             )
 
-        # -----------------------------------------------------
-        # Création de la réservation
-        # -----------------------------------------------------
+        # =====================================================
+        # CREATION RESERVATION
+        # =====================================================
 
         reservation = Reservation.objects.create(
             client=client,
-            **validated_data
+            **validated_data,
         )
 
         return reservation
 
     # =========================================================
-    # UPDATE
+    # MODIFICATION
     # =========================================================
 
     @transaction.atomic
@@ -575,75 +794,117 @@ class ReservationSerializer(serializers.ModelSerializer):
 
         client_full_name = validated_data.pop(
             "client_full_name",
-            None
+            None,
         )
 
         client_phone = validated_data.pop(
             "client_phone",
-            None
+            None,
         )
 
         client_email = validated_data.pop(
             "client_email",
-            None
+            None,
         )
 
         client_address = validated_data.pop(
             "client_address",
-            None
+            None,
         )
-
-        # -----------------------------------------------------
-        # Mise à jour du client
-        # -----------------------------------------------------
 
         client = instance.client
 
-        if client_full_name is not None:
-            client.full_name = client_full_name.strip()
+        # =====================================================
+        # CLIENT
+        # =====================================================
 
-        if client_phone is not None:
-            new_phone = client_phone.strip()
+        if client:
 
-            # Vérifier qu'un autre client n'utilise pas
-            # déjà ce numéro
-            duplicate = Client.objects.filter(
-                phone=new_phone
-            ).exclude(
-                pk=client.pk
-            ).exists()
+            # -------------------------------------------------
+            # NOM
+            # -------------------------------------------------
 
-            if duplicate:
-                raise serializers.ValidationError({
-                    "client_phone": (
-                        "Un autre client utilise déjà "
-                        "ce numéro de téléphone."
-                    )
-                })
+            if client_full_name is not None:
 
-            client.phone = new_phone
+                client.full_name = (
+                    client_full_name.strip()
+                )
 
-        if client_email is not None:
-            client.email = client_email.strip()
+            # -------------------------------------------------
+            # TELEPHONE
+            # -------------------------------------------------
 
-        if client_address is not None:
-            client.address = client_address.strip()
+            if client_phone is not None:
 
-        client.save()
+                new_phone = normalize_phone(
+                    client_phone
+                )
 
-        # -----------------------------------------------------
-        # Mise à jour réservation
-        # -----------------------------------------------------
+                if not new_phone:
+                    raise serializers.ValidationError({
+                        "client_phone": (
+                            "Le numéro de téléphone "
+                            "est obligatoire."
+                        )
+                    })
+
+                duplicate = (
+                    Client.objects
+                    .filter(phone=new_phone)
+                    .exclude(pk=client.pk)
+                    .exists()
+                )
+
+                if duplicate:
+                    raise serializers.ValidationError({
+                        "client_phone": (
+                            "Un autre client utilise déjà "
+                            "ce numéro de téléphone."
+                        )
+                    })
+
+                client.phone = new_phone
+
+            # -------------------------------------------------
+            # EMAIL
+            # -------------------------------------------------
+
+            if client_email is not None:
+
+                client.email = (
+                    client_email.strip()
+                    if client_email
+                    else None
+                )
+
+            # -------------------------------------------------
+            # ADRESSE
+            # -------------------------------------------------
+
+            if client_address is not None:
+
+                client.address = (
+                    client_address.strip()
+                    if client_address
+                    else None
+                )
+
+            client.save()
+
+        # =====================================================
+        # RESERVATION
+        # =====================================================
 
         for field, value in validated_data.items():
-            setattr(instance, field, value)
+            setattr(
+                instance,
+                field,
+                value,
+            )
 
         instance.save()
 
         return instance
-
-
-
 
 
 

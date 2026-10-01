@@ -1,4 +1,7 @@
 from decimal import Decimal
+from django.utils.dateparse import parse_date
+
+from django.db.models import Count
 
 from django.http import JsonResponse, HttpResponse, FileResponse
 from django.db import transaction
@@ -75,15 +78,13 @@ from .serializers import (
 
 from .services.pdf_service import generate_payment_receipt_pdf
 
-
-
-
-
-
-
-
-
-
+from django.db.models import (
+    Count,
+    DecimalField,
+    F,
+    Q,
+    Sum,
+)
 
 
 # ============================================================
@@ -310,6 +311,20 @@ class TarifViewSet(viewsets.ModelViewSet):
 
 
 class PaymentViewSet(viewsets.ModelViewSet):
+    """
+    Gestion complète des paiements.
+
+    Fonctions :
+    - GET    /payments/
+    - GET    /payments/<id>/
+    - POST   /payments/
+    - PUT    /payments/<id>/
+    - PATCH  /payments/<id>/
+    - DELETE /payments/<id>/
+    - POST   /payments/<id>/valider/
+    - POST   /payments/<id>/annuler/
+    - GET    /payments/<id>/recu/
+    """
 
     queryset = (
         Payment.objects
@@ -327,6 +342,108 @@ class PaymentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     # ========================================================
+    # UTILITAIRES
+    # ========================================================
+
+    def _get_payment_for_update(self, pk):
+        """
+        Verrouille uniquement la ligne Payment.
+
+        IMPORTANT :
+        On ne fait PAS de select_related() ici avec
+        select_for_update() afin d'éviter PostgreSQL :
+
+        FOR UPDATE ne peut pas être appliqué sur le côté
+        possiblement NULL d'une jointure externe.
+        """
+
+        return (
+            Payment.objects
+            .select_for_update()
+            .get(pk=pk)
+        )
+
+    def _get_reservation_for_update(self, reservation_id):
+        """
+        Verrouille séparément la réservation.
+        """
+
+        return (
+            Reservation.objects
+            .select_for_update()
+            .get(pk=reservation_id)
+        )
+
+    def _get_account_for_update(self, account_id):
+        """
+        Verrouille séparément le compte financier.
+        """
+
+        return (
+            FinancialAccount.objects
+            .select_for_update()
+            .get(pk=account_id)
+        )
+
+    def _calculate_paid_amount(self, reservation):
+        """
+        Calcule le montant total des paiements validés
+        pour une réservation.
+        """
+
+        result = (
+            Payment.objects
+            .filter(
+                reservation=reservation,
+                status=Payment.Status.VALIDE,
+            )
+            .aggregate(
+                total=Sum("amount")
+            )
+        )
+
+        return (
+            result.get("total")
+            or Decimal("0.00")
+        )
+
+    def _calculate_remaining_amount(self, reservation):
+        """
+        Calcule le reste à payer.
+
+        Formule :
+
+        total réservation
+        - paiements validés
+        + remboursements
+        """
+
+        total = (
+            reservation.total_amount
+            or Decimal("0.00")
+        )
+
+        already_paid = self._calculate_paid_amount(
+            reservation
+        )
+
+        refunded = (
+            reservation.refunded_amount
+            or Decimal("0.00")
+        )
+
+        remaining = (
+            total
+            - already_paid
+            + refunded
+        )
+
+        if remaining < Decimal("0.00"):
+            remaining = Decimal("0.00")
+
+        return remaining
+
+    # ========================================================
     # CREATION
     # ========================================================
 
@@ -335,7 +452,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         validated_data = serializer.validated_data
 
-        reservation = validated_data.get("reservation")
+        reservation = validated_data.get(
+            "reservation"
+        )
 
         idempotency_key = validated_data.get(
             "idempotency_key"
@@ -349,7 +468,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
             existing_payment = (
                 Payment.objects
-                .select_for_update()
                 .filter(
                     idempotency_key=idempotency_key
                 )
@@ -366,7 +484,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 })
 
         # ----------------------------------------------------
-        # VERROUILLAGE DE LA RESERVATION
+        # VERROUILLAGE RESERVATION
         # ----------------------------------------------------
 
         locked_reservation = None
@@ -376,50 +494,24 @@ class PaymentViewSet(viewsets.ModelViewSet):
             locked_reservation = (
                 Reservation.objects
                 .select_for_update()
-                .select_related("tarif")
                 .get(
                     pk=reservation.pk
                 )
             )
-
-            # ------------------------------------------------
-            # TOTAL RESERVATION
-            # ------------------------------------------------
 
             total = (
                 locked_reservation.total_amount
                 or Decimal("0.00")
             )
 
-            # ------------------------------------------------
-            # TOTAL DEJA PAYE
-            # ------------------------------------------------
-
-            already_paid = (
-                Payment.objects
-                .filter(
-                    reservation=locked_reservation,
-                    status=Payment.Status.VALIDE,
-                )
-                .aggregate(
-                    total=Sum("amount")
-                )
-                .get("total")
-                or Decimal("0.00")
+            already_paid = self._calculate_paid_amount(
+                locked_reservation
             )
-
-            # ------------------------------------------------
-            # TOTAL REMBOURSE
-            # ------------------------------------------------
 
             refunded = (
                 locked_reservation.refunded_amount
                 or Decimal("0.00")
             )
-
-            # ------------------------------------------------
-            # RESTE A PAYER
-            # ------------------------------------------------
 
             remaining = (
                 total
@@ -439,6 +531,19 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 "status",
                 Payment.Status.EN_ATTENTE,
             )
+
+            # ------------------------------------------------
+            # MONTANT POSITIF
+            # ------------------------------------------------
+
+            if amount <= Decimal("0.00"):
+
+                raise serializers.ValidationError({
+                    "amount": (
+                        "Le montant du paiement doit "
+                        "être supérieur à zéro."
+                    )
+                })
 
             # ------------------------------------------------
             # PAIEMENT ANNULE INTERDIT A LA CREATION
@@ -488,17 +593,38 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 locked_reservation
             )
 
+        else:
+
+            # ------------------------------------------------
+            # PAIEMENT SANS RESERVATION
+            # ------------------------------------------------
+
+            amount = (
+                validated_data.get("amount")
+                or Decimal("0.00")
+            )
+
+            if amount <= Decimal("0.00"):
+
+                raise serializers.ValidationError({
+                    "amount": (
+                        "Le montant du paiement doit "
+                        "être supérieur à zéro."
+                    )
+                })
+
         # ----------------------------------------------------
         # REFERENCE UNIQUE
         # ----------------------------------------------------
 
-        reference = validated_data.get("reference")
+        reference = validated_data.get(
+            "reference"
+        )
 
         if reference:
 
             existing_reference = (
                 Payment.objects
-                .select_for_update()
                 .filter(
                     reference=reference
                 )
@@ -516,12 +642,217 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 })
 
         # ----------------------------------------------------
-        # CREATION DU PAIEMENT
+        # CREATION
         # ----------------------------------------------------
 
         serializer.save(
             created_by=self.request.user
         )
+
+    # ========================================================
+    # MODIFICATION
+    # ========================================================
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+
+        payment = (
+            Payment.objects
+            .select_for_update()
+            .get(
+                pk=serializer.instance.pk
+            )
+        )
+
+        # ----------------------------------------------------
+        # PAIEMENT VALIDE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.VALIDE:
+
+            raise serializers.ValidationError({
+                "detail": (
+                    "Un paiement déjà validé ne peut pas "
+                    "être modifié directement. "
+                    "Utilisez un remboursement ou "
+                    "une correction."
+                )
+            })
+
+        # ----------------------------------------------------
+        # PAIEMENT ANNULE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.ANNULE:
+
+            raise serializers.ValidationError({
+                "detail": (
+                    "Un paiement annulé ne peut pas "
+                    "être modifié."
+                )
+            })
+
+        # ----------------------------------------------------
+        # NOUVELLE RESERVATION
+        # ----------------------------------------------------
+
+        reservation = serializer.validated_data.get(
+            "reservation",
+            payment.reservation,
+        )
+
+        amount = serializer.validated_data.get(
+            "amount",
+            payment.amount,
+        )
+
+        if amount is None or amount <= Decimal("0.00"):
+
+            raise serializers.ValidationError({
+                "amount": (
+                    "Le montant du paiement doit "
+                    "être supérieur à zéro."
+                )
+            })
+
+        # ----------------------------------------------------
+        # VERIFICATION RESERVATION
+        # ----------------------------------------------------
+
+        if reservation:
+
+            locked_reservation = (
+                Reservation.objects
+                .select_for_update()
+                .get(
+                    pk=reservation.pk
+                )
+            )
+
+            total = (
+                locked_reservation.total_amount
+                or Decimal("0.00")
+            )
+
+            other_paid = (
+                Payment.objects
+                .filter(
+                    reservation=locked_reservation,
+                    status=Payment.Status.VALIDE,
+                )
+                .exclude(
+                    pk=payment.pk
+                )
+                .aggregate(
+                    total=Sum("amount")
+                )
+                .get("total")
+                or Decimal("0.00")
+            )
+
+            refunded = (
+                locked_reservation.refunded_amount
+                or Decimal("0.00")
+            )
+
+            remaining = (
+                total
+                - other_paid
+                + refunded
+            )
+
+            if remaining < Decimal("0.00"):
+                remaining = Decimal("0.00")
+
+            if amount > remaining:
+
+                raise serializers.ValidationError({
+                    "amount": (
+                        "Le montant maximum autorisé est "
+                        f"{remaining} $."
+                    )
+                })
+
+            serializer.validated_data[
+                "reservation"
+            ] = locked_reservation
+
+        # ----------------------------------------------------
+        # REFERENCE UNIQUE
+        # ----------------------------------------------------
+
+        reference = serializer.validated_data.get(
+            "reference",
+            payment.reference,
+        )
+
+        if reference:
+
+            existing_reference = (
+                Payment.objects
+                .filter(
+                    reference=reference
+                )
+                .exclude(
+                    pk=payment.pk
+                )
+                .first()
+            )
+
+            if existing_reference:
+
+                raise serializers.ValidationError({
+                    "reference": (
+                        "Cette référence de paiement "
+                        "est déjà utilisée."
+                    )
+                })
+
+        serializer.save()
+
+    # ========================================================
+    # SUPPRESSION
+    # ========================================================
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+
+        payment = (
+            Payment.objects
+            .select_for_update()
+            .get(
+                pk=instance.pk
+            )
+        )
+
+        # ----------------------------------------------------
+        # PAIEMENT VALIDE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.VALIDE:
+
+            raise serializers.ValidationError({
+                "detail": (
+                    "Un paiement validé ne peut pas être "
+                    "supprimé. Utilisez un remboursement "
+                    "ou une correction."
+                )
+            })
+
+        # ----------------------------------------------------
+        # PAIEMENT ANNULE
+        # ----------------------------------------------------
+
+        if payment.status == Payment.Status.ANNULE:
+
+            raise serializers.ValidationError({
+                "detail": (
+                    "Un paiement annulé ne peut pas "
+                    "être supprimé."
+                )
+            })
+
+        payment.delete()
 
     # ========================================================
     # VALIDER UN PAIEMENT
@@ -536,25 +867,27 @@ class PaymentViewSet(viewsets.ModelViewSet):
     def valider(self, request, pk=None):
 
         # ----------------------------------------------------
-        # VERROUILLER LE PAIEMENT
+        # VERROUILLER UNIQUEMENT LE PAIEMENT
         # ----------------------------------------------------
 
-        payment = (
-            Payment.objects
-            .select_for_update()
-            .select_related(
-                "reservation",
-                "reservation__client",
-                "financial_account",
-            )
-            .get(pk=pk)
-        )
+        payment = self._get_payment_for_update(pk)
 
         # ----------------------------------------------------
         # DEJA VALIDE
         # ----------------------------------------------------
 
         if payment.status == Payment.Status.VALIDE:
+
+            payment = (
+                Payment.objects
+                .select_related(
+                    "reservation",
+                    "reservation__client",
+                    "financial_account",
+                    "created_by",
+                )
+                .get(pk=payment.pk)
+            )
 
             return Response(
                 {
@@ -588,7 +921,26 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
         # ----------------------------------------------------
-        # VERROUILLER LA RESERVATION
+        # VERIFIER MONTANT
+        # ----------------------------------------------------
+
+        if (
+            payment.amount is None
+            or payment.amount <= Decimal("0.00")
+        ):
+
+            return Response(
+                {
+                    "detail": (
+                        "Le montant du paiement doit "
+                        "être supérieur à zéro."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ----------------------------------------------------
+        # RESERVATION
         # ----------------------------------------------------
 
         reservation = None
@@ -598,15 +950,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             reservation = (
                 Reservation.objects
                 .select_for_update()
-                .select_related("tarif")
                 .get(
                     pk=payment.reservation_id
                 )
             )
-
-            # ------------------------------------------------
-            # TOTAL RESERVATION
-            # ------------------------------------------------
 
             total = (
                 reservation.total_amount
@@ -614,13 +961,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
             # ------------------------------------------------
-            # AUTRES PAIEMENTS DEJA VALIDES
+            # AUTRES PAIEMENTS VALIDES
             # ------------------------------------------------
 
             other_paid = (
                 Payment.objects
                 .filter(
-                    reservation=reservation,
+                    reservation_id=reservation.pk,
                     status=Payment.Status.VALIDE,
                 )
                 .exclude(
@@ -680,9 +1027,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 return Response(
                     {
                         "detail": (
-                            f"Le montant du paiement "
+                            "Le montant du paiement "
                             f"({payment.amount} $) dépasse "
-                            f"le reste à payer "
+                            "le reste à payer "
                             f"({remaining} $)."
                         )
                     },
@@ -690,7 +1037,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
 
         # ====================================================
-        # VALIDATION
+        # VALIDATION DU PAIEMENT
         # ====================================================
 
         payment.status = Payment.Status.VALIDE
@@ -705,38 +1052,26 @@ class PaymentViewSet(viewsets.ModelViewSet):
         # MOUVEMENT FINANCIER
         # ====================================================
 
-        if payment.financial_account:
+        if payment.financial_account_id:
 
-            # ------------------------------------------------
-            # VERROUILLER LE COMPTE
-            # ------------------------------------------------
-
-            account = (
-                FinancialAccount.objects
-                .select_for_update()
-                .get(
-                    pk=payment.financial_account_id
-                )
+            account = self._get_account_for_update(
+                payment.financial_account_id
             )
 
             # ------------------------------------------------
-            # VERIFIER SI LE MOUVEMENT EXISTE
+            # EVITER LE DOUBLE MOUVEMENT
             # ------------------------------------------------
 
             mouvement_existe = (
                 CashMovement.objects
                 .filter(
-                    payment=payment,
+                    payment_id=payment.pk,
                     movement_type=(
                         CashMovement.MovementType.ENTREE
                     ),
                 )
                 .exists()
             )
-
-            # ------------------------------------------------
-            # CREER LE MOUVEMENT UNE SEULE FOIS
-            # ------------------------------------------------
 
             if not mouvement_existe:
 
@@ -789,6 +1124,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
         # ====================================================
+        # RECHARGER POUR SERIALIZER
+        # ====================================================
+
+        payment = (
+            Payment.objects
+            .select_related(
+                "reservation",
+                "reservation__client",
+                "financial_account",
+                "created_by",
+            )
+            .get(
+                pk=payment.pk
+            )
+        )
+
+        # ====================================================
         # REPONSE
         # ====================================================
 
@@ -814,11 +1166,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def annuler(self, request, pk=None):
 
-        payment = (
-            Payment.objects
-            .select_for_update()
-            .get(pk=pk)
-        )
+        payment = self._get_payment_for_update(pk)
 
         # ----------------------------------------------------
         # DEJA VALIDE
@@ -865,6 +1213,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
             ]
         )
 
+        # ----------------------------------------------------
+        # REPONSE
+        # ----------------------------------------------------
+
+        payment = (
+            Payment.objects
+            .select_related(
+                "reservation",
+                "reservation__client",
+                "financial_account",
+                "created_by",
+            )
+            .get(
+                pk=payment.pk
+            )
+        )
+
         return Response(
             PaymentSerializer(
                 payment,
@@ -896,12 +1261,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 "reservation",
                 "reservation__client",
                 "financial_account",
+                "created_by",
             )
-            .get(pk=pk)
+            .get(
+                pk=pk
+            )
         )
 
         # ----------------------------------------------------
-        # VERIFICATION DU STATUT
+        # VERIFICATION STATUT
         # ----------------------------------------------------
 
         if payment.status != Payment.Status.VALIDE:
@@ -917,7 +1285,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
         # ----------------------------------------------------
-        # GENERER LE PDF
+        # GENERATION PDF
         # ----------------------------------------------------
 
         try:
@@ -955,11 +1323,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
             content_type="application/pdf",
         )
 
-        # ----------------------------------------------------
-        # INLINE :
-        # LE NAVIGATEUR PEUT AFFICHER LE PDF
-        # ----------------------------------------------------
-
         response[
             "Content-Disposition"
         ] = (
@@ -974,12 +1337,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
 
         return response
-
-
-
-# ============================================================
-# RESERVATIONS
-# ============================================================
 
 # ============================================================
 # RESERVATIONS
@@ -1505,35 +1862,80 @@ class PersonnelViewSet(viewsets.ModelViewSet):
 # TABLEAU DE BORD / RAPPORTS
 # ============================================================
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def dashboard_report(request):
+
+
+
+
+
+def _dashboard_filters(request):
     """
-    Tableau de bord global de l'application.
+    Récupère les filtres envoyés par le frontend.
 
-    Sources financières :
-    - chiffre d'affaires théorique : tarifs des réservations non annulées
-    - encaissements : paiements VALIDES
-    - dépenses : Expense
-    - remboursements : Refund
-    - soldes : FinancialAccount
-    - mouvements : CashMovement
+    Filtres acceptés :
+
+        date=2026-10-01
+        jour=1
+        mois=10
+        annee=2026
+
+        date_debut=2026-10-01
+        date_fin=2026-10-31
     """
 
-    # ========================================================
-    # QUERYSETS
-    # ========================================================
+    params = request.query_params
 
-    reservations = (
-        Reservation.objects
-        .select_related(
-            "client",
-            "hall",
-            "tarif",
-        )
-        .prefetch_related("payments", "refunds")
-        .all()
+    date_value = parse_date(
+        (params.get("date") or "").strip()
     )
+
+    date_debut = parse_date(
+        (params.get("date_debut") or "").strip()
+    )
+
+    date_fin = parse_date(
+        (params.get("date_fin") or "").strip()
+    )
+
+    try:
+        jour = int(params.get("jour"))
+        if jour < 1 or jour > 31:
+            jour = None
+    except (TypeError, ValueError):
+        jour = None
+
+    try:
+        mois = int(params.get("mois"))
+        if mois < 1 or mois > 12:
+            mois = None
+    except (TypeError, ValueError):
+        mois = None
+
+    try:
+        annee = int(params.get("annee"))
+        if annee < 2000 or annee > 2100:
+            annee = None
+    except (TypeError, ValueError):
+        annee = None
+
+    return {
+        "date": date_value,
+        "jour": jour,
+        "mois": mois,
+        "annee": annee,
+        "date_debut": date_debut,
+        "date_fin": date_fin,
+    }
+
+
+def _filter_dashboard_querysets(request):
+    """
+    Applique les mêmes filtres à toutes les sources
+    du dashboard.
+    """
+
+    filters_data = _dashboard_filters(request)
+
+    reservations = Reservation.objects.all()
 
     payments = Payment.objects.filter(
         status=Payment.Status.VALIDE
@@ -1543,11 +1945,216 @@ def dashboard_report(request):
 
     refunds = Refund.objects.all()
 
-    accounts = FinancialAccount.objects.filter(
-        is_active=True
+    movements = CashMovement.objects.all()
+
+    # ========================================================
+    # DATE EXACTE
+    # ========================================================
+
+    if filters_data["date"]:
+
+        reservations = reservations.filter(
+            event_date=filters_data["date"]
+        )
+
+        payments = payments.filter(
+            payment_date__date=filters_data["date"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__date=filters_data["date"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__date=filters_data["date"]
+        )
+
+        movements = movements.filter(
+            created_at__date=filters_data["date"]
+        )
+
+    # ========================================================
+    # JOUR
+    # ========================================================
+
+    if filters_data["jour"]:
+
+        reservations = reservations.filter(
+            event_date__day=filters_data["jour"]
+        )
+
+        payments = payments.filter(
+            payment_date__day=filters_data["jour"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__day=filters_data["jour"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__day=filters_data["jour"]
+        )
+
+        movements = movements.filter(
+            created_at__day=filters_data["jour"]
+        )
+
+    # ========================================================
+    # MOIS
+    # ========================================================
+
+    if filters_data["mois"]:
+
+        reservations = reservations.filter(
+            event_date__month=filters_data["mois"]
+        )
+
+        payments = payments.filter(
+            payment_date__month=filters_data["mois"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__month=filters_data["mois"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__month=filters_data["mois"]
+        )
+
+        movements = movements.filter(
+            created_at__month=filters_data["mois"]
+        )
+
+    # ========================================================
+    # ANNEE
+    # ========================================================
+
+    if filters_data["annee"]:
+
+        reservations = reservations.filter(
+            event_date__year=filters_data["annee"]
+        )
+
+        payments = payments.filter(
+            payment_date__year=filters_data["annee"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__year=filters_data["annee"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__year=filters_data["annee"]
+        )
+
+        movements = movements.filter(
+            created_at__year=filters_data["annee"]
+        )
+
+    # ========================================================
+    # DATE DEBUT
+    # ========================================================
+
+    if filters_data["date_debut"]:
+
+        reservations = reservations.filter(
+            event_date__gte=filters_data["date_debut"]
+        )
+
+        payments = payments.filter(
+            payment_date__date__gte=filters_data["date_debut"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__date__gte=filters_data["date_debut"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__date__gte=filters_data["date_debut"]
+        )
+
+        movements = movements.filter(
+            created_at__date__gte=filters_data["date_debut"]
+        )
+
+    # ========================================================
+    # DATE FIN
+    # ========================================================
+
+    if filters_data["date_fin"]:
+
+        reservations = reservations.filter(
+            event_date__lte=filters_data["date_fin"]
+        )
+
+        payments = payments.filter(
+            payment_date__date__lte=filters_data["date_fin"]
+        )
+
+        expenses = expenses.filter(
+            expense_date__date__lte=filters_data["date_fin"]
+        )
+
+        refunds = refunds.filter(
+            refund_date__date__lte=filters_data["date_fin"]
+        )
+
+        movements = movements.filter(
+            created_at__date__lte=filters_data["date_fin"]
+        )
+
+    return (
+        reservations,
+        payments,
+        expenses,
+        refunds,
+        movements,
+        filters_data,
     )
 
-    movements = CashMovement.objects.all()
+def _dashboard_payload(request):
+    """
+    Construit toutes les données du dashboard
+    directement depuis PostgreSQL.
+    """
+
+    (
+        reservations,
+        payments,
+        expenses,
+        refunds,
+        movements,
+        filters_data,
+    ) = _filter_dashboard_querysets(request)
+
+    reservations = reservations.select_related(
+        "client",
+        "hall",
+        "tarif",
+    )
+
+    payments = payments.select_related(
+        "reservation",
+        "reservation__client",
+        "financial_account",
+    )
+
+    expenses = expenses.select_related(
+        "created_by",
+    )
+
+    refunds = refunds.select_related(
+        "payment",
+        "reservation",
+        "financial_account",
+    )
+
+    movements = movements.select_related(
+        "account",
+        "payment",
+        "reservation",
+        "created_by",
+    )
 
     # ========================================================
     # RESERVATIONS
@@ -1571,7 +2178,7 @@ def dashboard_report(request):
     ).count()
 
     # ========================================================
-    # CHIFFRE D'AFFAIRES THEORIQUE
+    # CHIFFRE D'AFFAIRES
     # ========================================================
 
     chiffre_affaires = Decimal("0.00")
@@ -1581,7 +2188,8 @@ def dashboard_report(request):
         if reservation.status == Reservation.Status.ANNULEE:
             continue
 
-        if reservation.tarif_id:
+        if reservation.tarif:
+
             chiffre_affaires += (
                 reservation.tarif.amount
                 or Decimal("0.00")
@@ -1592,11 +2200,9 @@ def dashboard_report(request):
     # ========================================================
 
     total_encaisse = (
-        payments
-        .aggregate(
+        payments.aggregate(
             total=Sum("amount")
-        )
-        .get("total")
+        ).get("total")
         or Decimal("0.00")
     )
 
@@ -1605,30 +2211,20 @@ def dashboard_report(request):
     # ========================================================
 
     total_depenses = (
-        expenses
-        .exclude(
-            status=Expense.Status.ANNULEE
-        )
-        .aggregate(
+        expenses.aggregate(
             total=Sum("amount")
-        )
-        .get("total")
+        ).get("total")
         or Decimal("0.00")
     )
 
     # ========================================================
-    # REMBOURSEMENTS VALIDES
+    # REMBOURSEMENTS
     # ========================================================
 
     total_rembourse = (
-        refunds
-        .filter(
-            status=Refund.Status.VALIDE
-        )
-        .aggregate(
+        refunds.aggregate(
             total=Sum("amount")
-        )
-        .get("total")
+        ).get("total")
         or Decimal("0.00")
     )
 
@@ -1643,60 +2239,68 @@ def dashboard_report(request):
         if reservation.status == Reservation.Status.ANNULEE:
             continue
 
-        montant_reservation = Decimal("0.00")
+        reste_a_recouvrer += (
+            reservation.remaining_amount
+            or Decimal("0.00")
+        )
 
-        if reservation.tarif_id:
-            montant_reservation = (
-                reservation.tarif.amount
+    # ========================================================
+    # COMPTES FINANCIERS
+    # ========================================================
+
+    accounts = list(
+        FinancialAccount.objects.filter(
+            is_active=True
+        ).order_by("name")
+    )
+
+    solde_comptes = sum(
+        (
+            account.balance
+            or Decimal("0.00")
+        )
+        for account in accounts
+    )
+
+    comptes = []
+
+    for account in accounts:
+
+        comptes.append({
+            "id": account.id,
+            "name": account.name,
+            "account_type": account.account_type,
+            "account_type_label": (
+                account.get_account_type_display()
+            ),
+            "balance": float(
+                account.balance
                 or Decimal("0.00")
-            )
-
-        montant_paye = (
-            payments
-            .filter(
-                reservation_id=reservation.id
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        montant_rembourse = (
-            refunds
-            .filter(
-                reservation_id=reservation.id,
-                status=Refund.Status.VALIDE,
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        montant_net_paye = (
-            montant_paye - montant_rembourse
-        )
-
-        reste = (
-            montant_reservation
-            - montant_net_paye
-        )
-
-        if reste > Decimal("0.00"):
-            reste_a_recouvrer += reste
+            ),
+        })
 
     # ========================================================
-    # SOLDE DES COMPTES
+    # MOUVEMENTS
     # ========================================================
 
-    solde_comptes = (
-        accounts
-        .aggregate(
-            total=Sum("balance")
+    total_entrees = (
+        movements.filter(
+            movement_type=(
+                CashMovement.MovementType.ENTREE
+            )
         )
+        .aggregate(total=Sum("amount"))
+        .get("total")
+        or Decimal("0.00")
+    )
+
+    total_sorties = (
+        movements.filter(
+            movement_type__in=[
+                CashMovement.MovementType.SORTIE,
+            ]
+        )
+        .aggregate(total=Sum("amount"))
         .get("total")
         or Decimal("0.00")
     )
@@ -1712,149 +2316,143 @@ def dashboard_report(request):
     )
 
     # ========================================================
-    # COMPTES FINANCIERS
-    # ========================================================
-
-    comptes = []
-
-    for account in accounts:
-
-        comptes.append({
-            "id": account.id,
-            "name": account.name,
-            "account_type": account.account_type,
-            "account_type_display": (
-                account.get_account_type_display()
-            ),
-            "balance": float(
-                account.balance
-                or Decimal("0.00")
-            ),
-            "is_active": account.is_active,
-        })
-
-    # ========================================================
     # PAIEMENTS PAR MODE
     # ========================================================
 
-    paiements_par_mode = []
+    payments_by_method = []
 
-    for method, label in Payment.Method.choices:
-
-        total = (
-            payments
-            .filter(
-                method=method
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
+    methods = (
+        payments
+        .values("method")
+        .annotate(
+            amount=Sum("amount")
         )
+        .order_by("method")
+    )
 
-        paiements_par_mode.append({
+    payment_display_map = dict(
+        Payment.Method.choices
+    )
+
+    for item in methods:
+
+        method = item["method"]
+
+        payments_by_method.append({
             "method": method,
-            "label": label,
-            "amount": float(total),
+            "label": payment_display_map.get(
+                method,
+                method,
+            ),
+            "amount": float(
+                item["amount"]
+                or Decimal("0.00")
+            ),
         })
 
     # ========================================================
     # DEPENSES PAR CATEGORIE
     # ========================================================
-    #
-    # Expense.category est actuellement un CharField simple.
-    #
-    # Il n'existe donc PAS :
-    #
-    # Expense.ExpenseType.choices
-    #
-    # Les catégories utilisées par le formulaire sont définies
-    # ici de manière cohérente avec le frontend.
-    # ========================================================
 
-    expense_categories = [
-        ("EAU", "Eau"),
-        ("ELECTRICITE", "Électricité"),
-        ("SALAIRE", "Salaire"),
-        ("AUTRE", "Autre"),
-    ]
+    expenses_by_category = []
 
-    depenses_par_categorie = []
-
-    for category, label in expense_categories:
-
-        total = (
-            expenses
-            .filter(
-                category=category
-            )
-            .exclude(
-                status=Expense.Status.ANNULEE
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
+    categories = (
+        expenses
+        .values("category")
+        .annotate(
+            amount=Sum("amount")
         )
+        .order_by("category")
+    )
 
-        depenses_par_categorie.append({
+    expense_category_map = dict(
+        getattr(
+            Expense,
+            "ExpenseType",
+            []
+        ).choices
+        if hasattr(Expense, "ExpenseType")
+        else []
+    )
+
+    for item in categories:
+
+        category = item["category"]
+
+        expenses_by_category.append({
             "category": category,
-            "label": label,
-            "amount": float(total),
+            "label": expense_category_map.get(
+                category,
+                category,
+            ),
+            "amount": float(
+                item["amount"]
+                or Decimal("0.00")
+            ),
         })
 
     # ========================================================
     # RESERVATIONS PAR STATUT
     # ========================================================
 
-    reservations_par_statut = []
+    reservations_by_status = []
 
-    for status_value, label in Reservation.Status.choices:
+    statuses = (
+        reservations
+        .values("status")
+        .annotate(
+            count=Count("id")
+        )
+        .order_by("status")
+    )
 
-        total = reservations.filter(
-            status=status_value
-        ).count()
+    reservation_status_map = dict(
+        Reservation.Status.choices
+    )
 
-        reservations_par_statut.append({
+    for item in statuses:
+
+        status_value = item["status"]
+
+        reservations_by_status.append({
             "status": status_value,
-            "label": label,
-            "count": total,
+            "label": reservation_status_map.get(
+                status_value,
+                status_value,
+            ),
+            "count": item["count"],
         })
 
     # ========================================================
-    # REVENUS MENSUELS
+    # RECETTES MENSUELLES
     # ========================================================
 
-    revenus_mensuels = (
+    revenues = (
         payments
-        .filter(
-            payment_date__isnull=False
-        )
         .annotate(
-            mois=TruncMonth("payment_date")
+            month=TruncMonth("payment_date")
         )
-        .values("mois")
+        .values("month")
         .annotate(
-            total=Sum("amount")
+            amount=Sum("amount")
         )
-        .order_by("mois")
+        .order_by("month")
     )
 
     revenus_chart = []
 
-    for item in revenus_mensuels:
+    for item in revenues:
 
-        mois = item.get("mois")
-
-        if not mois:
-            continue
+        month = item["month"]
 
         revenus_chart.append({
-            "month": mois.strftime("%Y-%m"),
+            "month": (
+                month.strftime("%Y-%m")
+                if month
+                else ""
+            ),
             "amount": float(
-                item.get("total")
+                item["amount"]
                 or Decimal("0.00")
             ),
         })
@@ -1863,81 +2461,66 @@ def dashboard_report(request):
     # DEPENSES MENSUELLES
     # ========================================================
 
-    depenses_mensuelles = (
+    expense_months = (
         expenses
-        .exclude(
-            status=Expense.Status.ANNULEE
-        )
-        .filter(
-            expense_date__isnull=False
-        )
         .annotate(
-            mois=TruncMonth("expense_date")
+            month=TruncMonth("expense_date")
         )
-        .values("mois")
+        .values("month")
         .annotate(
-            total=Sum("amount")
+            amount=Sum("amount")
         )
-        .order_by("mois")
+        .order_by("month")
     )
 
     depenses_chart = []
 
-    for item in depenses_mensuelles:
+    for item in expense_months:
 
-        mois = item.get("mois")
-
-        if not mois:
-            continue
+        month = item["month"]
 
         depenses_chart.append({
-            "month": mois.strftime("%Y-%m"),
+            "month": (
+                month.strftime("%Y-%m")
+                if month
+                else ""
+            ),
             "amount": float(
-                item.get("total")
+                item["amount"]
                 or Decimal("0.00")
             ),
         })
 
     # ========================================================
-    # MOUVEMENTS FINANCIERS
+    # REPONSE
     # ========================================================
 
-    total_entrees = (
-        movements
-        .filter(
-            movement_type=CashMovement.MovementType.ENTREE
-        )
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
+    return {
+        "filters": {
+            "date": (
+                filters_data["date"].isoformat()
+                if filters_data["date"]
+                else None
+            ),
+            "jour": filters_data["jour"],
+            "mois": filters_data["mois"],
+            "annee": filters_data["annee"],
+            "date_debut": (
+                filters_data["date_debut"].isoformat()
+                if filters_data["date_debut"]
+                else None
+            ),
+            "date_fin": (
+                filters_data["date_fin"].isoformat()
+                if filters_data["date_fin"]
+                else None
+            ),
+        },
 
-    total_sorties = (
-        movements
-        .filter(
-            movement_type=CashMovement.MovementType.SORTIE
-        )
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    # ========================================================
-    # REPONSE FINALE
-    # ========================================================
-
-    return Response({
         "summary": {
             "total_reservations": total_reservations,
-
             "reservations_actives": reservations_actives,
-
             "reservations_annulees": reservations_annulees,
-
             "reservations_terminees": reservations_terminees,
 
             "chiffre_affaires": float(
@@ -1979,252 +2562,212 @@ def dashboard_report(request):
 
         "accounts": comptes,
 
-        "payments_by_method": paiements_par_mode,
+        "payments_by_method": (
+            payments_by_method
+        ),
 
-        "expenses_by_category": depenses_par_categorie,
+        "expenses_by_category": (
+            expenses_by_category
+        ),
 
-        "reservations_by_status": reservations_par_statut,
+        "reservations_by_status": (
+            reservations_by_status
+        ),
 
         "monthly": {
             "revenues": revenus_chart,
             "expenses": depenses_chart,
         },
-    })
+    }
+
+
 # ============================================================
-# EXPORT EXCEL
+# API DASHBOARD
 # ============================================================
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_report(request):
+
+    return Response(
+        _dashboard_payload(request),
+        status=200,
+    )
+
+
+## ============================================================
+# EXPORT EXCEL
+# ============================================================
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_excel(request):
 
-    reservations = (
-        Reservation.objects
-        .select_related(
-            "client",
-            "hall",
-            "tarif",
-        )
-        .prefetch_related("payments")
-        .all()
+    (
+        reservations,
+        payments,
+        expenses,
+        refunds,
+        movements,
+        filters_data,
+    ) = _filter_dashboard_querysets(request)
+
+    # ========================================================
+    # RELATIONS OPTIMISÉES
+    # ========================================================
+
+    reservations = reservations.select_related(
+        "client",
+        "hall",
+        "tarif",
     )
 
-    payments = (
-        Payment.objects
-        .select_related(
-            "reservation",
-            "reservation__client",
-            "financial_account",
-        )
-        .filter(
-            status=Payment.Status.VALIDE
-        )
+    payments = payments.select_related(
+        "reservation",
+        "reservation__client",
+        "financial_account",
     )
 
-    expenses = (
-        Expense.objects
-        .select_related(
-            "created_by"
-        )
-        .all()
+    expenses = expenses.select_related(
+        "created_by",
     )
 
-    movements = (
-        CashMovement.objects
-        .select_related(
-            "account",
-            "reservation",
-            "payment",
-        )
-        .all()
+    refunds = refunds.select_related(
+        "payment",
+        "reservation",
+        "financial_account",
     )
 
-    refunds = Refund.objects.all()
+    movements = movements.select_related(
+        "account",
+        "reservation",
+        "payment",
+    )
+
+    # ========================================================
+    # CLASSEUR
+    # ========================================================
 
     workbook = Workbook()
 
     # ========================================================
-    # FEUILLE SYNTHESE
+    # SYNTHÈSE
     # ========================================================
 
-    ws = workbook.active
-    ws.title = "Synthèse"
+    summary_sheet = workbook.active
+    summary_sheet.title = "Synthèse"
 
-    ws.append([
-        "RAPPORT FINANCIER - ELISABETH"
+    summary_sheet.append([
+        "RAPPORT FINANCIER - LA CASA DA FESTA ELISABETH"
     ])
 
-    ws.append([])
+    summary_sheet.append([])
 
-    # Chiffre d'affaires théorique
-    chiffre_affaires = Decimal("0.00")
+    payload = _dashboard_payload(request)
+    summary = payload["summary"]
 
-    for reservation in reservations:
-
-        if reservation.status == Reservation.Status.ANNULEE:
-            continue
-
-        if reservation.tarif:
-            chiffre_affaires += (
-                reservation.tarif.amount
-                or Decimal("0.00")
-            )
-
-    encaisse = (
-        payments
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    depenses = (
-        expenses
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    remboursements = (
-        refunds
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    reste = Decimal("0.00")
-
-    for reservation in reservations:
-
-        if reservation.status == Reservation.Status.ANNULEE:
-            continue
-
-        montant = Decimal("0.00")
-
-        if reservation.tarif:
-            montant = (
-                reservation.tarif.amount
-                or Decimal("0.00")
-            )
-
-        paye = (
-            payments
-            .filter(
-                reservation=reservation
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        difference = montant - paye
-
-        if difference > Decimal("0.00"):
-            reste += difference
-
-    resultat = (
-        encaisse
-        - depenses
-        - remboursements
-    )
-
-    synthese = [
-        ["Indicateur", "Montant"],
-        [
+    summary_rows = [
+        (
+            "Réservations",
+            summary.get("total_reservations", 0),
+        ),
+        (
+            "Réservations actives",
+            summary.get("reservations_actives", 0),
+        ),
+        (
+            "Réservations annulées",
+            summary.get("reservations_annulees", 0),
+        ),
+        (
+            "Réservations terminées",
+            summary.get("reservations_terminees", 0),
+        ),
+        (
             "Chiffre d'affaires",
-            float(chiffre_affaires),
-        ],
-        [
+            summary.get("chiffre_affaires", 0),
+        ),
+        (
             "Total encaissé",
-            float(encaisse),
-        ],
-        [
+            summary.get("total_encaisse", 0),
+        ),
+        (
             "Total dépenses",
-            float(depenses),
-        ],
-        [
-            "Total remboursements",
-            float(remboursements),
-        ],
-        [
+            summary.get("total_depenses", 0),
+        ),
+        (
+            "Total remboursé",
+            summary.get("total_rembourse", 0),
+        ),
+        (
             "Reste à recouvrer",
-            float(reste),
-        ],
-        [
+            summary.get("reste_a_recouvrer", 0),
+        ),
+        (
+            "Solde comptes",
+            summary.get("solde_comptes", 0),
+        ),
+        (
             "Résultat net",
-            float(resultat),
-        ],
+            summary.get("resultat_net", 0),
+        ),
+        (
+            "Total entrées",
+            summary.get("total_entrees", 0),
+        ),
+        (
+            "Total sorties",
+            summary.get("total_sorties", 0),
+        ),
     ]
 
-    for row in synthese:
-        ws.append(row)
+    summary_sheet.append([
+        "Indicateur",
+        "Valeur",
+    ])
 
-    ws["A1"].font = Font(
-        bold=True,
-        size=16,
-    )
+    for label, value in summary_rows:
+
+        summary_sheet.append([
+            label,
+            value,
+        ])
 
     # ========================================================
-    # RESERVATIONS
+    # RÉSERVATIONS
     # ========================================================
 
-    ws_res = workbook.create_sheet(
+    reservation_sheet = workbook.create_sheet(
         "Réservations"
     )
 
-    ws_res.append([
-        "Numéro",
+    reservation_sheet.append([
+        "N°",
         "Client",
+        "Téléphone",
         "Salle",
-        "Événement",
+        "Type",
         "Date",
-        "Tarif",
-        "Payé",
-        "Reste",
         "Statut",
         "Paiement",
+        "Montant",
+        "Payé",
+        "Reste",
     ])
 
     for reservation in reservations:
 
-        tarif = Decimal("0.00")
-
-        if reservation.tarif:
-            tarif = (
-                reservation.tarif.amount
-                or Decimal("0.00")
-            )
-
-        paye = (
-            payments
-            .filter(
-                reservation=reservation
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        reste_reservation = tarif - paye
-
-        if reste_reservation < Decimal("0.00"):
-            reste_reservation = Decimal("0.00")
-
-        ws_res.append([
+        reservation_sheet.append([
             reservation.reservation_number,
 
             (
                 reservation.client.full_name
+                if reservation.client
+                else ""
+            ),
+
+            (
+                reservation.client.phone
                 if reservation.client
                 else ""
             ),
@@ -2235,44 +2778,57 @@ def dashboard_excel(request):
                 else ""
             ),
 
-            reservation.event_type,
+            reservation.event_type or "",
 
-            reservation.event_date,
-
-            float(tarif),
-
-            float(paye),
-
-            float(reste_reservation),
+            (
+                reservation.event_date.isoformat()
+                if reservation.event_date
+                else ""
+            ),
 
             reservation.get_status_display(),
 
             reservation.get_payment_status_display(),
+
+            float(
+                reservation.total_amount
+                or Decimal("0.00")
+            ),
+
+            float(
+                reservation.net_paid_amount
+                or Decimal("0.00")
+            ),
+
+            float(
+                reservation.remaining_amount
+                or Decimal("0.00")
+            ),
         ])
 
     # ========================================================
     # PAIEMENTS
     # ========================================================
 
-    ws_pay = workbook.create_sheet(
+    payment_sheet = workbook.create_sheet(
         "Paiements"
     )
 
-    ws_pay.append([
+    payment_sheet.append([
         "ID",
         "Réservation",
         "Client",
         "Montant",
+        "Date",
         "Mode",
         "Compte",
-        "Date",
         "Référence",
         "Statut",
     ])
 
     for payment in payments:
 
-        ws_pay.append([
+        payment_sheet.append([
             payment.id,
 
             (
@@ -2290,9 +2846,25 @@ def dashboard_excel(request):
                 else ""
             ),
 
-            float(payment.amount),
+            float(
+                payment.amount
+                or Decimal("0.00")
+            ),
 
-            payment.get_method_display(),
+            (
+                payment.payment_date.isoformat()
+                if payment.payment_date
+                else ""
+            ),
+
+            (
+                payment.get_method_display()
+                if hasattr(
+                    payment,
+                    "get_method_display"
+                )
+                else payment.method
+            ),
 
             (
                 payment.financial_account.name
@@ -2300,73 +2872,194 @@ def dashboard_excel(request):
                 else ""
             ),
 
-            payment.payment_date,
-
             payment.reference or "",
 
-            payment.get_status_display(),
+            (
+                payment.get_status_display()
+                if hasattr(
+                    payment,
+                    "get_status_display"
+                )
+                else payment.status
+            ),
         ])
 
     # ========================================================
-    # DEPENSES
+    # DÉPENSES
     # ========================================================
 
-    ws_exp = workbook.create_sheet(
+    expense_sheet = workbook.create_sheet(
         "Dépenses"
     )
 
-    ws_exp.append([
+    expense_sheet.append([
         "ID",
         "Catégorie",
-        "Description",
+        "Titre",
+        "Notes",
         "Montant",
-        "Compte",
         "Date",
     ])
 
     for expense in expenses:
 
-        ws_exp.append([
+        expense_sheet.append([
             expense.id,
-            expense.get_category_display(),
-            expense.description,
-            float(expense.amount),
 
             (
-                expense.financial_account.name
-                if expense.financial_account
+                expense.get_category_display()
+                if hasattr(
+                    expense,
+                    "get_category_display"
+                )
+                else getattr(
+                    expense,
+                    "category",
+                    "",
+                )
+            ),
+
+            getattr(
+                expense,
+                "title",
+                "",
+            ) or "",
+
+            getattr(
+                expense,
+                "notes",
+                "",
+            ) or "",
+
+            float(
+                getattr(
+                    expense,
+                    "amount",
+                    Decimal("0.00"),
+                )
+                or Decimal("0.00")
+            ),
+
+            (
+                expense.expense_date.isoformat()
+                if getattr(
+                    expense,
+                    "expense_date",
+                    None,
+                )
+                else ""
+            ),
+        ])
+
+    # ========================================================
+    # REMBOURSEMENTS
+    # ========================================================
+
+    refund_sheet = workbook.create_sheet(
+        "Remboursements"
+    )
+
+    refund_sheet.append([
+        "ID",
+        "Réservation",
+        "Paiement",
+        "Montant",
+        "Date",
+        "Mode",
+        "Compte",
+        "Motif",
+        "Référence",
+        "Statut",
+    ])
+
+    for refund in refunds:
+
+        refund_sheet.append([
+            refund.id,
+
+            (
+                refund.reservation.reservation_number
+                if refund.reservation
                 else ""
             ),
 
-            expense.expense_date,
+            (
+                refund.payment.id
+                if refund.payment
+                else ""
+            ),
+
+            float(
+                refund.amount
+                or Decimal("0.00")
+            ),
+
+            (
+                refund.refund_date.isoformat()
+                if refund.refund_date
+                else ""
+            ),
+
+            (
+                refund.get_method_display()
+                if hasattr(
+                    refund,
+                    "get_method_display"
+                )
+                else getattr(
+                    refund,
+                    "method",
+                    "",
+                )
+            ),
+
+            (
+                refund.financial_account.name
+                if refund.financial_account
+                else ""
+            ),
+
+            refund.reason or "",
+
+            refund.reference or "",
+
+            (
+                refund.get_status_display()
+                if hasattr(
+                    refund,
+                    "get_status_display"
+                )
+                else getattr(
+                    refund,
+                    "status",
+                    "",
+                )
+            ),
         ])
 
     # ========================================================
     # MOUVEMENTS
     # ========================================================
 
-    ws_mov = workbook.create_sheet(
+    movement_sheet = workbook.create_sheet(
         "Mouvements"
     )
 
-    ws_mov.append([
+    movement_sheet.append([
         "ID",
+        "Compte",
         "Type",
         "Montant",
-        "Compte",
         "Description",
-        "Réservation",
         "Date",
+        "Réservation",
+        "Paiement",
     ])
 
     for movement in movements:
 
-        ws_mov.append([
+        movement_sheet.append([
             movement.id,
-
-            movement.get_movement_type_display(),
-
-            float(movement.amount),
 
             (
                 movement.account.name
@@ -2374,7 +3067,35 @@ def dashboard_excel(request):
                 else ""
             ),
 
-            movement.description,
+            (
+                movement.get_movement_type_display()
+                if hasattr(
+                    movement,
+                    "get_movement_type_display"
+                )
+                else getattr(
+                    movement,
+                    "movement_type",
+                    "",
+                )
+            ),
+
+            float(
+                movement.amount
+                or Decimal("0.00")
+            ),
+
+            getattr(
+                movement,
+                "description",
+                "",
+            ) or "",
+
+            (
+                movement.created_at.isoformat()
+                if movement.created_at
+                else ""
+            ),
 
             (
                 movement.reservation.reservation_number
@@ -2382,51 +3103,81 @@ def dashboard_excel(request):
                 else ""
             ),
 
-            movement.created_at,
+            (
+                movement.payment.id
+                if movement.payment
+                else ""
+            ),
         ])
 
     # ========================================================
-    # LARGEUR DES COLONNES
+    # STYLE DES FEUILLES
     # ========================================================
 
-    for sheet in workbook.worksheets:
+    for worksheet in workbook.worksheets:
 
-        for column in sheet.columns:
+        # ----------------------------------------------------
+        # En-tête
+        # ----------------------------------------------------
 
-            max_length = 0
-
-            column_letter = (
-                column[0].column_letter
-            )
-
-            for cell in column:
-
-                value = str(
-                    cell.value or ""
-                )
-
-                if len(value) > max_length:
-                    max_length = len(value)
-
-            sheet.column_dimensions[
-                column_letter
-            ].width = min(
-                max_length + 3,
-                40,
-            )
-
-        for cell in sheet[1]:
+        for cell in worksheet[1]:
 
             cell.font = Font(
                 bold=True
             )
 
             cell.alignment = Alignment(
-                horizontal="center"
+                horizontal="center",
+                vertical="center",
+            )
+
+        # ----------------------------------------------------
+        # Deuxième ligne pour la synthèse
+        # ----------------------------------------------------
+
+        if worksheet.title == "Synthèse":
+
+            for cell in worksheet[3]:
+
+                cell.font = Font(
+                    bold=True
+                )
+
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                )
+
+        # ----------------------------------------------------
+        # Largeur automatique des colonnes
+        # ----------------------------------------------------
+
+        for column_cells in worksheet.columns:
+
+            max_length = 0
+
+            for cell in column_cells:
+
+                value = (
+                    str(cell.value)
+                    if cell.value is not None
+                    else ""
+                )
+
+                max_length = max(
+                    max_length,
+                    len(value),
+                )
+
+            worksheet.column_dimensions[
+                column_cells[0].column_letter
+            ].width = min(
+                max_length + 2,
+                45,
             )
 
     # ========================================================
-    # REPONSE
+    # RÉPONSE HTTP
     # ========================================================
 
     response = HttpResponse(
@@ -2436,152 +3187,24 @@ def dashboard_excel(request):
         )
     )
 
-    response[
-        "Content-Disposition"
-    ] = (
+    response["Content-Disposition"] = (
         'attachment; filename="rapport-elisabeth.xlsx"'
     )
 
     workbook.save(response)
 
     return response
-
-
-
-
-
-
-
-
 # ============================================================
 # EXPORT PDF
 # ============================================================
-
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_pdf(request):
 
-    reservations = (
-        Reservation.objects
-        .select_related("tarif")
-        .prefetch_related("payments")
-        .all()
-    )
+    payload = _dashboard_payload(request)
 
-    payments = Payment.objects.filter(
-        status=Payment.Status.VALIDE
-    )
-
-    expenses = Expense.objects.all()
-
-    refunds = Refund.objects.all()
-
-    # ========================================================
-    # CHIFFRE D'AFFAIRES
-    # ========================================================
-
-    chiffre_affaires = Decimal("0.00")
-
-    for reservation in reservations:
-
-        if reservation.status == Reservation.Status.ANNULEE:
-            continue
-
-        if reservation.tarif:
-            chiffre_affaires += (
-                reservation.tarif.amount
-                or Decimal("0.00")
-            )
-
-    # ========================================================
-    # ENCAISSE
-    # ========================================================
-
-    encaisse = (
-        payments
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    # ========================================================
-    # DEPENSES
-    # ========================================================
-
-    depenses = (
-        expenses
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    # ========================================================
-    # REMBOURSEMENTS
-    # ========================================================
-
-    remboursements = (
-        refunds
-        .aggregate(
-            total=Sum("amount")
-        )
-        .get("total")
-        or Decimal("0.00")
-    )
-
-    # ========================================================
-    # RESTE A RECOUVRER
-    # ========================================================
-
-    reste = Decimal("0.00")
-
-    for reservation in reservations:
-
-        if reservation.status == Reservation.Status.ANNULEE:
-            continue
-
-        montant = Decimal("0.00")
-
-        if reservation.tarif:
-            montant = (
-                reservation.tarif.amount
-                or Decimal("0.00")
-            )
-
-        paye = (
-            payments
-            .filter(
-                reservation=reservation
-            )
-            .aggregate(
-                total=Sum("amount")
-            )
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        difference = montant - paye
-
-        if difference > Decimal("0.00"):
-            reste += difference
-
-    # ========================================================
-    # RESULTAT
-    # ========================================================
-
-    resultat = (
-        encaisse
-        - depenses
-        - remboursements
-    )
-
-    # ========================================================
-    # REPONSE PDF
-    # ========================================================
+    summary = payload["summary"]
 
     response = HttpResponse(
         content_type="application/pdf"
@@ -2590,16 +3213,17 @@ def dashboard_pdf(request):
     response[
         "Content-Disposition"
     ] = (
-        'attachment; filename="rapport-elisabeth.pdf"'
+        'attachment; '
+        'filename="rapport-elisabeth.pdf"'
     )
 
     document = SimpleDocTemplate(
         response,
         pagesize=A4,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40,
+        rightMargin=25,
+        leftMargin=25,
+        topMargin=25,
+        bottomMargin=25,
     )
 
     styles = getSampleStyleSheet()
@@ -2608,65 +3232,166 @@ def dashboard_pdf(request):
 
     elements.append(
         Paragraph(
-            "LA CASA DA FESTA ELISABETH",
+            "La Casa da Festa Elisabeth",
             styles["Title"],
         )
     )
 
     elements.append(
         Paragraph(
-            "Rapport général d'activité",
+            "Rapport du tableau de bord",
             styles["Heading2"],
         )
     )
 
     elements.append(
-        Spacer(1, 20)
+        Spacer(1, 15)
     )
 
-    data = [
+    # ========================================================
+    # FILTRES
+    # ========================================================
+
+    filter_lines = []
+
+    dashboard_filters = payload.get(
+        "filters",
+        {}
+    )
+
+    if dashboard_filters.get("date"):
+        filter_lines.append(
+            f"Date : {dashboard_filters['date']}"
+        )
+
+    if dashboard_filters.get("jour"):
+        filter_lines.append(
+            f"Jour : {dashboard_filters['jour']}"
+        )
+
+    if dashboard_filters.get("mois"):
+        filter_lines.append(
+            f"Mois : {dashboard_filters['mois']}"
+        )
+
+    if dashboard_filters.get("annee"):
+        filter_lines.append(
+            f"Année : {dashboard_filters['annee']}"
+        )
+
+    if dashboard_filters.get("date_debut"):
+        filter_lines.append(
+            f"Du : {dashboard_filters['date_debut']}"
+        )
+
+    if dashboard_filters.get("date_fin"):
+        filter_lines.append(
+            f"Au : {dashboard_filters['date_fin']}"
+        )
+
+    if filter_lines:
+
+        elements.append(
+            Paragraph(
+                " | ".join(filter_lines),
+                styles["Normal"],
+            )
+        )
+
+        elements.append(
+            Spacer(1, 10)
+        )
+
+    # ========================================================
+    # SYNTHESE
+    # ========================================================
+
+    summary_data = [
+        ["Indicateur", "Valeur"],
+
         [
-            "Indicateur",
-            "Montant",
+            "Réservations",
+            str(
+                summary["total_reservations"]
+            ),
+        ],
+
+        [
+            "Réservations actives",
+            str(
+                summary["reservations_actives"]
+            ),
+        ],
+
+        [
+            "Réservations annulées",
+            str(
+                summary["reservations_annulees"]
+            ),
+        ],
+
+        [
+            "Réservations terminées",
+            str(
+                summary["reservations_terminees"]
+            ),
         ],
 
         [
             "Chiffre d'affaires",
-            f"{chiffre_affaires:,.2f} $",
+            f'{summary["chiffre_affaires"]:.2f} $',
         ],
 
         [
             "Total encaissé",
-            f"{encaisse:,.2f} $",
+            f'{summary["total_encaisse"]:.2f} $',
         ],
 
         [
-            "Total dépenses",
-            f"{depenses:,.2f} $",
+            "Dépenses",
+            f'{summary["total_depenses"]:.2f} $',
         ],
 
         [
-            "Total remboursements",
-            f"{remboursements:,.2f} $",
+            "Remboursements",
+            f'{summary["total_rembourse"]:.2f} $',
         ],
 
         [
             "Reste à recouvrer",
-            f"{reste:,.2f} $",
+            f'{summary["reste_a_recouvrer"]:.2f} $',
+        ],
+
+        [
+            "Solde comptes",
+            f'{summary["solde_comptes"]:.2f} $',
         ],
 
         [
             "Résultat net",
-            f"{resultat:,.2f} $",
+            f'{summary["resultat_net"]:.2f} $',
+        ],
+
+        [
+            "Total entrées",
+            f'{summary["total_entrees"]:.2f} $',
+        ],
+
+        [
+            "Total sorties",
+            f'{summary["total_sorties"]:.2f} $',
         ],
     ]
 
-    table = Table(
-        data,
-        colWidths=[300, 150],
+    summary_table = Table(
+        summary_data,
+        colWidths=[
+            100,
+            100,
+        ],
     )
 
-    table.setStyle(
+    summary_table.setStyle(
         TableStyle([
             (
                 "BACKGROUND",
@@ -2697,45 +3422,164 @@ def dashboard_pdf(request):
                 "PADDING",
                 (0, 0),
                 (-1, -1),
-                8,
+                6,
             ),
         ])
     )
 
-    elements.append(table)
+    elements.append(
+        summary_table
+    )
 
     elements.append(
         Spacer(1, 20)
     )
 
-    elements.append(
-        Paragraph(
-            f"Nombre total de réservations : "
-            f"{reservations.count()}",
-            styles["BodyText"],
-        )
-    )
+    # ========================================================
+    # PAIEMENTS PAR MODE
+    # ========================================================
 
     elements.append(
         Paragraph(
-            f"Nombre de paiements validés : "
-            f"{payments.count()}",
-            styles["BodyText"],
+            "Paiements par mode",
+            styles["Heading2"],
         )
     )
 
+    payment_rows = [
+        [
+            "Mode",
+            "Montant",
+        ]
+    ]
+
+    for item in payload[
+        "payments_by_method"
+    ]:
+
+        payment_rows.append([
+            item["label"],
+            f'{item["amount"]:.2f} $',
+        ])
+
+    payment_table = Table(
+        payment_rows,
+        colWidths=[
+            120,
+            100,
+        ],
+    )
+
+    payment_table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#1e293b"),
+            ),
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white,
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey,
+            ),
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                5,
+            ),
+        ])
+    )
+
+    elements.append(
+        payment_table
+    )
+
+    elements.append(
+        Spacer(1, 20)
+    )
+
+    # ========================================================
+    # DEPENSES PAR CATEGORIE
+    # ========================================================
+
     elements.append(
         Paragraph(
-            f"Nombre de dépenses : "
-            f"{expenses.count()}",
-            styles["BodyText"],
+            "Dépenses par catégorie",
+            styles["Heading2"],
         )
+    )
+
+    expense_rows = [
+        [
+            "Catégorie",
+            "Montant",
+        ]
+    ]
+
+    for item in payload[
+        "expenses_by_category"
+    ]:
+
+        expense_rows.append([
+            item["label"],
+            f'{item["amount"]:.2f} $',
+        ])
+
+    expense_table = Table(
+        expense_rows,
+        colWidths=[
+            120,
+            100,
+        ],
+    )
+
+    expense_table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#1e293b"),
+            ),
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white,
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey,
+            ),
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                5,
+            ),
+        ])
+    )
+
+    elements.append(
+        expense_table
     )
 
     document.build(elements)
 
     return response
-
 
 
 

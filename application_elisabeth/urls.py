@@ -1,27 +1,28 @@
-from django.urls import path, include
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    CashMovementViewSet,
     ClientViewSet,
-    HallViewSet,
+    ContractViewSet,
+    ExpenseViewSet,
+    FinancialAccountViewSet,
     HallImageViewSet,
     HallVideoViewSet,
+    HallViewSet,
     MaterialViewSet,
-    FinancialAccountViewSet,
-    TarifViewSet,
     PaymentViewSet,
-    ReservationViewSet,
-    ExpenseViewSet,
-    CashMovementViewSet,
-    ContractViewSet,
     PersonnelViewSet,
     RefundViewSet,
+    ReservationViewSet,
+    TarifViewSet,
     calendar_view,
-    dashboard_report,
     dashboard_excel,
     dashboard_pdf,
+    dashboard_report,
 )
 
+app_name = "api"
 
 # ============================================================
 # ROUTER API
@@ -119,46 +120,42 @@ router.register(
 # ============================================================
 
 urlpatterns = [
-
     # --------------------------------------------------------
     # ROUTER PRINCIPAL
     # --------------------------------------------------------
-
     path(
         "",
         include(router.urls),
     ),
-
     # --------------------------------------------------------
     # CALENDRIER
     # --------------------------------------------------------
-
+    path(
+        "calendar/",
+        calendar_view,
+        name="calendar-current",
+    ),
     path(
         "calendar/<int:year>/<int:month>/",
         calendar_view,
-        name="calendar",
+        name="calendar-month",
     ),
-
     # --------------------------------------------------------
-    # TABLEAU DE BORD
+    # TABLEAU DE BORD & EXPORTS
     # --------------------------------------------------------
-
     path(
         "dashboard/",
         dashboard_report,
-        name="dashboard",
+        name="dashboard-report",
     ),
-
     path(
         "dashboard/excel/",
         dashboard_excel,
         name="dashboard-excel",
     ),
-
     path(
         "dashboard/pdf/",
         dashboard_pdf,
         name="dashboard-pdf",
     ),
 ]
-
